@@ -138,6 +138,44 @@ class CompressionLayer(nn.Module):
         return z_sparse
         
 
+class Stage2(nn.Module):
+    def __init__(self, z_dim, num_latents, latent_size, num_layers):
+
+        """
+        Here we use a Perceiver Style Cross Attention mechanism. Our Stage 2 memory
+        creates a more abstract representation of the memory being stored. This mechanism
+        allows us to create num_latents "gist tokens" that each represent some part of the memory.
+        The latent vectors are learned
+        """
+        super().__init__()
+
+        self.input_proj = nn.Linear(z_dim, latent_size)
+
+        self.latents = nn.Parameter(torch.randn((num_latents, latent_size)))
+
+        self.cross_attention = nn.ModuleList([
+            nn.TransformerDecoderLayer(
+                d_model = latent_size,
+                nhead=4,
+                dim_feedforward=latent_size * 2,
+                batch_first=True
+            )
+
+            for _ in range(num_layers)
+        ])
+
+    def forward(self, z_sparse):
+        # Expand latents for batch
+        B = z_sparse.size(0)
+        latents = self.latents.unsqueeze(0).expand(B, -1, -1)
+
+        proj = self.input_proj(z_sparse).unsqueeze(1) # (B, 1, latent_dim) NOT CURRENTLY USING
+
+        for layer in self.cross_attention:
+            latents = layer(tgt=latents, memory=proj) #latents are used for query, proj for key and value
+
+        return latents #(B, num_latents, latent_size)
+
 
 
 
