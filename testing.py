@@ -258,15 +258,95 @@ class Stage1(nn.Module):
         return z_recon
     
 
+
+class VAE_LTM(nn.Module):
+    def __init__(self, input_dim, latent_dim):
+        super().__init__()
+        self.silu = nn.SiLU()
+        self.lin1 = nn.Linear(input_dim, input_dim/2)
+        self.lin2 = nn.Linear(input_dim/2, input_dim/4)
+        self.mean = nn.Linear(input_dim/4, latent_dim)
+        self.std = nn.Linear(input_dim/4, latent_dim)
+        self.dec1 = nn.Linear(latent_dim, input_dim/2)
+        self.out = nn.Linear(input_dim/2, input_dim)
+        
+    def encode(self, query):
+        
+        mem = self.silu(self.lin1(query))
+        mem = self.silu(self.lin2(mem))
+        mean = self.silu(self.mean(mem))
+        std = self.silu(self.std(mem))
+        
+        return mean, std
+    
+    def reparam(self, mean, std):
+        rand = torch.randn_like(std)
+        z = mean + std * rand
+        return z
+
+    def decode(self, z):
+        t = self.silu(self.dec1(z))
+        out = self.silu(self.out(z))
+        return out
+    
+
 """
 Integration Layer (CA1)
 
-Our Integration Layer is responsible 
+Our Integration Layer is responsible for integrating memory traces with context. From the Compression layer (CA3) the Intregation layer receives the top z_sparse traces stores in our memory buffer and then integrates them with context from the entorhinal layer.
+From the VAE LTM, the Integration layer recevies the decoder reconstructions and integrates them with context from the entorhinal layer
 """
 
 class IntegrationLayer(nn.Module):
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
+    def __init__(self, z_dim, ent_dim, vae_dim):
+        super().__init__()
+
+        self.proj_z = nn.Linear(z_dim, ent_dim)
+        self.proj_vae = nn.Linear(vae_dim, ent_dim)
+        self.proj_ent = nn.Linear(ent_dim, ent_dim)
+
+        self.gating = nn.Sigmoid()
+        self.cross_attn = nn.MultiheadAttention(ent_dim, num_heads=4, batch_first=True)
+
+        self.lin = nn.Linear(ent_dim * 2, ent_dim)
+
+
+    def forward(self, z_sparse, h_ent, vae):
+
+        vae_proj = self.proj_vae(vae)
+        z_proj = self.proj_ent(z_sparse)
+        ent_proj = self.proj_ent(h_ent)
+
+        memory = torch.cat([z_sparse, vae_proj], dim=1)
+        int_mem = self.cross_attn(ent_proj, memory, memory)
+
+        gate = torch.cat([ent_proj, int_mem], dim=-1)
+        g = self.gating(self.lin(gate))
+
+        z_int = (1 - g) * ent_proj + g * int_mem
+
+        return z_int
+
+"""
+NOTE: I think we should only add this to the LAST hidden state of the LLM as all the layers
+up to that are just building context into that final hidden state and all we are doing is 
+adding more context which is naturally cumulated in the final hidden state.
+"""
+class OutputLayer(nn.Module):
+    def __init__(self, model_dim, int_dim):
+        super().__init__()
+
+        self.lin = nn.Linear(int_dim, model_dim) #model_dim is model embedding dim (2048 in tinyllama)
+        self.lin_gate = nn.Linear(int_dim, 1)
+        self.nonlin = nn.SiLU()
+
+    def forward(self, int_mem):
+
+        gate = self.lin_gate(int_mem)
+        mem = self.lin(int_mem)
+        mem_final = self.nonlin(mem)
+
+        return mem_final, gate
     
 
 if __name__ == "__main__":
