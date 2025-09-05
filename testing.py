@@ -1,6 +1,7 @@
 from transformers import AutoTokenizer, AutoModelForCausalLM
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 """
 tokenizer = AutoTokenizer.from_pretrained("TinyLlama/TinyLlama-1.1B-intermediate-step-1431k-3T")
@@ -138,10 +139,11 @@ def kWTA(input, k):
     # Get the k-th largest value
     # topk returns values and indices, we need the k-th value
     # torch.topk returns values in descending order, so the k-th value is at index k-1
-    kth_value = input.topk(k, largest=True, sorted=True).values[..., -1].unsqueeze(-1)
+    kth_value = torch.topk(input, k, dim=-1)
+    thresh = kth_value[:, -1].unsqueeze(-1)
 
     # Create a mask where values greater than or equal to the k-th value are True
-    mask = (input >= kth_value).to(input.dtype)
+    mask = (input >= thresh).to(input.dtype)
 
     # Apply the mask to the original tensor
     return input * mask
@@ -215,8 +217,8 @@ class Stage2(nn.Module):
         # Expand latents for batch
         B = z_sparse.size(0)
         latents = self.latents.unsqueeze(0).expand(B, -1, -1)
-
-        proj = self.input_proj(z_sparse).unsqueeze(1) # (B, 1, latent_dim) NOT CURRENTLY USING
+        contextualized = torch.cat([z_sparse, context_embedding], dim=-1)
+        proj = self.input_proj(contextualized).unsqueeze(1) # (B, 1, latent_dim) NOT CURRENTLY USING
 
         for layer in self.cross_attention:
             latents = layer(tgt=latents, memory=proj) #latents are used for query, proj for key and value
@@ -259,35 +261,42 @@ class Stage1(nn.Module):
     
 
 
-class VAE_LTM(nn.Module):
-    def __init__(self, input_dim, latent_dim):
+class SAE_LTM(nn.Module):
+    def __init__(self, storage_dim, retrieval_dim, input_dim=512, hidden_dim=4096):
         super().__init__()
+        
+        self.storage_head = nn.Linear(storage_dim, input_dim)
+        self.retrieval_head = nn.Linear(retrieval_dim, input_dim)
         self.silu = nn.SiLU()
-        self.lin1 = nn.Linear(input_dim, input_dim/2)
-        self.lin2 = nn.Linear(input_dim/2, input_dim/4)
-        self.mean = nn.Linear(input_dim/4, latent_dim)
-        self.std = nn.Linear(input_dim/4, latent_dim)
-        self.dec1 = nn.Linear(latent_dim, input_dim/2)
-        self.out = nn.Linear(input_dim/2, input_dim)
-        
-    def encode(self, query):
-        
-        mem = self.silu(self.lin1(query))
-        mem = self.silu(self.lin2(mem))
-        mean = self.silu(self.mean(mem))
-        std = self.silu(self.std(mem))
-        
-        return mean, std
-    
-    def reparam(self, mean, std):
-        rand = torch.randn_like(std)
-        z = mean + std * rand
-        return z
+        self.encoder = nn.Linear(input_dim, hidden_dim)
+        self.relu = nn.ReLU()
+        self.decoder = nn.Linear(hidden_dim, input_dim)
 
-    def decode(self, z):
-        t = self.silu(self.dec1(z))
-        out = self.silu(self.out(z))
-        return out
+    def forward(self, x, mode):
+
+        if mode == 0:
+            x = self.silu(self.storage_head(x))
+        else:
+            x = self.silu(self.retrieval_head(x))
+            
+        h = self.relu(self.encoder(x))
+        z_sparse = kWTA(h, 0.05)
+
+        recon = self.decoder(z_sparse)
+        return recon, z_sparse
+    
+    def loss(self, recon, target_1, target_2, z_sparse, beta=0.3, gamma=1e-4):  #Maybe add importance weighting
+
+        
+        stage_1_recon = F.mse_loss(recon, target_1)
+
+        stage_2_recon = F.mse_loss(recon, target_2)
+
+        sparsity_loss = torch.mean(torch.abs(z_sparse))
+
+        return stage_1_recon + (beta * stage_2_recon) + (gamma * sparsity_loss)
+    
+
     
 
 """
