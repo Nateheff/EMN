@@ -2,10 +2,11 @@ from transformers import AutoTokenizer, AutoModelForCausalLM
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from dataclasses import dataclass
 
-"""
+
 tokenizer = AutoTokenizer.from_pretrained("TinyLlama/TinyLlama-1.1B-intermediate-step-1431k-3T")
-model = AutoModelForCausalLM.from_pretrained("TinyLlama/TinyLlama-1.1B-intermediate-step-1431k-3T")
+# model = AutoModelForCausalLM.from_pretrained("TinyLlama/TinyLlama-1.1B-intermediate-step-1431k-3T")
 tokenizer.padding_side = 'right'
 tokenizer.add_special_tokens({'pad_token': tokenizer.eos_token})
 
@@ -22,10 +23,38 @@ prompt = "Hello."
 # inputs = tokenizer(prompts, padding=True, truncation=True, return_tensors='pt')
 inputs = tokenizer(prompt, return_tensors='pt')
 
-generate_ids = model.generate(inputs.input_ids, max_length=50)
-output = tokenizer.batch_decode(generate_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)
-print(output)
-"""
+captured_kv = {}
+
+def hook_func(module, input, output):
+    hidden_states = output[0] #hidden_states: [1, 3, 2048]
+
+    batch_size, sequence_len, _ = hidden_states.shape
+
+    # project to K/V manually using module's weights
+    k_proj = module.k_proj(hidden_states) #k_proj: [1, 3, 256] 
+    v_proj = module.v_proj(hidden_states) #v_proj: [1, 3, 256]
+    
+    _, _, proj_dim = k_proj.shape
+    """
+    our embd_dim is 2048, our head dim is 64, and we have 32 heads, so we would expect this to be 
+    64, but to speed up inference, they have the model have 4 key and value heads, with 32 query heads. So this results in our key and value projections being query_head_dim * 4, 256.
+    """
+
+    num_q_heads = module.num_heads #32
+    
+    q_head_dim = module.head_dim #64 (embd_dim: 2048 / num_head: 32 = 64)
+    num_kv_heads = proj_dim // q_head_dim
+
+
+    k = k_proj.view(batch_size, sequence_len, num_kv_heads, q_head_dim).transpose(1, 2) #pre-transpose: [1, 3, 4, 64] post: [1, 4, 3, 64]
+    v = v_proj.view(batch_size, sequence_len, num_kv_heads, q_head_dim).transpose(1, 2)
+    #pre-transpose: [1, 3, 4, 64] post: [1, 4, 3, 64]
+
+    captured_kv['k'] = k.detach()
+    captured_kv['v'] = v.detach()
+
+
+
 
 """
 This projection layer takes the lst hidden state of the LLM as input and outputs a query to the AH.
@@ -62,11 +91,12 @@ class PFC(nn.Module):
             input_ids=input_ids, 
             attention_mask=attention_mask,
             output_hidden_states=True,  # We need hidden states for our projection
+            output_attentions=True,
             **kwargs
         )
 
         # Get the last hidden state
-        last_hidden_state = outputs.hidden_states[-1]  # Shape: (batch_size, seq_len, hidden_size)
+        last_hidden_state = outputs.hidden_states[-1]  # Shape: (batch_size, seq_len, hidden_size) [1, 3, 2048]
 
         projection = self.projection_head(last_hidden_state)
 
@@ -79,6 +109,7 @@ class PFC(nn.Module):
     def generate(self, *args, **kwargs):
         #Delegate generation to the base model
         return self.base_model.generate(*args, **kwargs)
+
 
 """
 The Entorhinal Layer
@@ -253,11 +284,11 @@ class Stage1(nn.Module):
 
         z_proj = self.input_proj(z_sparse)
         attn_out = self.cross_attn(z_proj, llm_k, llm_v)
-        z = self.ln1(z_proj + attn_out)
+        z = self.ln1(z_proj + attn_out) #The vector we store as our Stage 2 context embedding
         mlp_out = self.mlp(z)
         z_recon = self.ln2(z + mlp_out)
 
-        return z_recon
+        return z_recon, z
     
 
 
@@ -356,8 +387,93 @@ class OutputLayer(nn.Module):
         mem_final = self.nonlin(mem)
 
         return mem_final, gate
+
+
+
+@dataclass
+class AH_Args:
+    proj_dim = 256
+    embd_dim = 2048
+    ent_dim = 1024
+    expansion = 10
+    k = int(ent_dim * expansion * 0.05) #512 for ~5% sparsity
+    z_dim = ent_dim * expansion
+    stage_1_hidden = 1024
+    stage_2_context_dim = embd_dim
+    num_latents = 8
+    latent_size = 256
+    num_layers = 2
+    storage_dim = num_latents * latent_size + stage_2_context_dim
+    retrieval_dim = z_dim
+    vae_dim = 512
+    int_dim = ent_dim
     
 
+
+
+class EMN(nn.Module):
+    def __init__(self, pfc, args:AH_Args):
+        super().__init__()
+        self.pfc = pfc
+        self.args = args
+
+        self.entorhinal = EntorhinalLayer(args.proj_dim, args.ent_dim)
+        self.compression = CompressionLayer(args.ent_dim, args.expansion, args.k)
+        self.stage_1 = Stage1(args.z_dim, args.embd_dim, args.stage_1_hidden)
+        self.stage_2 = Stage2(args.z_dim, args.stage_2_context_dim, args.num_latents, args.latent_size, args.num_layers)
+        self.ltm = SAE_LTM(args.storage_dim, args.retrieval_dim, args)
+        self.integration = IntegrationLayer(args.z_dim, args.ent_dim, args.vae_dim)
+        self.output = OutputLayer(args.embd_dim, args.int_dim)
+        
+        self.stage_2_buffer = []
+
+    def storage(self, prompt):
+
+        pfc_out = self.pfc(prompt)
+        pfc_hidden_state = pfc_out['last_hidden_state']
+        target_layer = model.base_model.base_model.layers[-1].self_attn
+        hook_handle = target_layer.register_forward_hook(hook_func)
+
+        ent_out = self.entorhinal(pfc_out['projected_output'])
+        z_sparse = self.compression(ent_out)
+
+        high_recon, context_embed = self.stage_1(z_sparse, captured_kv['k'], captured_kv['v']) 
+        stage_2_input = { 'z_sparse': z_sparse, 'context': context_embed} #store in some buffer until offline consolidation
+        self.stage_2_buffer.append(stage_2_input)
+
+        #TIME FOR OFFLINE CONSOLIDATION
+        #loop through and concat z_sparse and context for each stored memory
+
+        #run each through stage 2
+        for input in self.stage_2_buffer:
+            latents = self.stage_2(input['z_sparse'], input['context']) #[Batch, num_latents, latent_size]
+            latent_full = torch.stack(latents)
+            memory_trace = torch.cat[latent_full, input['z_sparse']]
+            sae_recon = self.ltm(memory_trace, 0)
+
+    def retrieve(self, prompt):
+        pfc_out = self.pfc(prompt)
+        ent_out = self.entorhinal(pfc_out['projected_output'])
+        z_sparse = self.compression(ent_out)
+
+        sae_out = self.ltm(z_sparse, 1)
+        int_out = self.integration(z_sparse, ent_out, sae_out)
+        final, gate = self.output(int_out)
+
+        #Do something with gate to check retrieval utility/confidence
+        #add back to LLM hidden state
+
+
+
+model = PFC()
+
+
+model_outputs = model(inputs.input_ids)
+# output = tokenizer.batch_decode(generate_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)
+# print(output)
+
+
+"""
 if __name__ == "__main__":
     # Load tokenizer
     tokenizer = AutoTokenizer.from_pretrained("TinyLlama/TinyLlama-1.1B-intermediate-step-1431k-3T")
@@ -383,3 +499,5 @@ if __name__ == "__main__":
     output_text = tokenizer.batch_decode(generate_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)
 
     print(output_text)
+
+"""
