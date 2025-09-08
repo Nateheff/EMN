@@ -23,35 +23,8 @@ prompt = "Hello."
 # inputs = tokenizer(prompts, padding=True, truncation=True, return_tensors='pt')
 inputs = tokenizer(prompt, return_tensors='pt')
 
-captured_kv = {}
-
-def hook_func(module, input, output):
-    hidden_states = output[0] #hidden_states: [1, 3, 2048]
-
-    batch_size, sequence_len, _ = hidden_states.shape
-
-    # project to K/V manually using module's weights
-    k_proj = module.k_proj(hidden_states) #k_proj: [1, 3, 256] 
-    v_proj = module.v_proj(hidden_states) #v_proj: [1, 3, 256]
-    
-    _, _, proj_dim = k_proj.shape
-    """
-    our embd_dim is 2048, our head dim is 64, and we have 32 heads, so we would expect this to be 
-    64, but to speed up inference, they have the model have 4 key and value heads, with 32 query heads. So this results in our key and value projections being query_head_dim * 4, 256.
-    """
-
-    num_q_heads = module.num_heads #32
-    
-    q_head_dim = module.head_dim #64 (embd_dim: 2048 / num_head: 32 = 64)
-    num_kv_heads = proj_dim // q_head_dim
 
 
-    k = k_proj.view(batch_size, sequence_len, num_kv_heads, q_head_dim).transpose(1, 2) #pre-transpose: [1, 3, 4, 64] post: [1, 4, 3, 64]
-    v = v_proj.view(batch_size, sequence_len, num_kv_heads, q_head_dim).transpose(1, 2)
-    #pre-transpose: [1, 3, 4, 64] post: [1, 4, 3, 64]
-
-    captured_kv['k'] = k.detach()
-    captured_kv['v'] = v.detach()
 
 
 
@@ -73,42 +46,6 @@ class ProjectionHead(nn.Module):
         x = self.proj(x)
         x = self.proj_norm(x)
         return x
-    
-
-class PFC(nn.Module):
-    def __init__(self, base_model_name="TinyLlama/TinyLlama-1.1B-intermediate-step-1431k-3T"):
-        super().__init__()
-
-        self.base_model = AutoModelForCausalLM.from_pretrained(base_model_name)
-
-        self.hidden_size = 2048 #Base model hidden size
-
-        self.projection_head = ProjectionHead(input_dim=self.hidden_size, output_dim=256)
-
-    def forward(self, input_ids, attention_mask=None, **kwargs):
-
-        outputs = self.base_model(
-            input_ids=input_ids, 
-            attention_mask=attention_mask,
-            output_hidden_states=True,  # We need hidden states for our projection
-            output_attentions=True,
-            **kwargs
-        )
-
-        # Get the last hidden state
-        last_hidden_state = outputs.hidden_states[-1]  # Shape: (batch_size, seq_len, hidden_size) [1, 3, 2048]
-
-        projection = self.projection_head(last_hidden_state)
-
-        return {
-            'base_model_outputs': outputs,
-            'projected_output': projection,
-            'last_hidden_state': last_hidden_state
-        }
-    
-    def generate(self, *args, **kwargs):
-        #Delegate generation to the base model
-        return self.base_model.generate(*args, **kwargs)
 
 
 """
@@ -161,7 +98,7 @@ class FamiliarityRetrieval(nn.Module):
 
     def forward(self, query, candidate):
 
-        cand = torch.cat(query, candidate)
+        cand = torch.cat([query, candidate], dim=-1)
         score = self.score(cand)
         return score
 
@@ -197,9 +134,9 @@ class CompressionLayer(nn.Module):
         self.expand = nn.Linear(self.input_dim, ent_dim * expansion)
         self.nonlin = nn.ReLU()
 
-    def forward(self, ent_output):
-
-        expansion = self.expand(ent_output)
+    def forward(self, ent_output, familiarity):
+        ent_fam = torch.cat([ent_output, familiarity], dim=-1)
+        expansion = self.expand(ent_fam)
         #ReLU begin the pattern separation
         expansion = self.nonlin(expansion)
 
@@ -283,8 +220,8 @@ class Stage1(nn.Module):
     def forward(self, z_sparse, llm_k, llm_v):
 
         z_proj = self.input_proj(z_sparse)
-        attn_out = self.cross_attn(z_proj, llm_k, llm_v)
-        z = self.ln1(z_proj + attn_out) #The vector we store as our Stage 2 context embedding
+        attn_out, _ = self.cross_attn(z_proj, llm_k, llm_v)
+        z = self.ln1(z_proj + attn_out) #The vector we store as our Stage 2 context embedding (Might need attn_out[0])
         mlp_out = self.mlp(z)
         z_recon = self.ln2(z + mlp_out)
 
@@ -303,7 +240,7 @@ class SAE_LTM(nn.Module):
         self.relu = nn.ReLU()
         self.decoder = nn.Linear(hidden_dim, input_dim)
 
-    def forward(self, x, mode):
+    def forward(self, x, mode, k=512):
 
         if mode == 0:
             x = self.silu(self.storage_head(x))
@@ -311,10 +248,10 @@ class SAE_LTM(nn.Module):
             x = self.silu(self.retrieval_head(x))
             
         h = self.relu(self.encoder(x))
-        z_sparse = kWTA(h, 0.05)
+        z_sparse = kWTA(h, k)
 
         recon = self.decoder(z_sparse)
-        return recon, z_sparse
+        return recon, z_sparse #We use this z_sparse for our loss, nothing else
     
     def loss(self, recon, target_1, target_2, z_sparse, beta=0.3, gamma=1e-4):  #Maybe add importance weighting
 
@@ -354,11 +291,11 @@ class IntegrationLayer(nn.Module):
     def forward(self, z_sparse, h_ent, vae):
 
         vae_proj = self.proj_vae(vae)
-        z_proj = self.proj_ent(z_sparse)
+        z_proj = self.proj_z(z_sparse)
         ent_proj = self.proj_ent(h_ent)
 
-        memory = torch.cat([z_sparse, vae_proj], dim=1)
-        int_mem = self.cross_attn(ent_proj, memory, memory)
+        memory = torch.cat([z_sparse, vae_proj], dim=-1)
+        int_mem, _ = self.cross_attn(ent_proj, memory, memory)
 
         gate = torch.cat([ent_proj, int_mem], dim=-1)
         g = self.gating(self.lin(gate))
@@ -368,26 +305,94 @@ class IntegrationLayer(nn.Module):
         return z_int
 
 """
-NOTE: I think we should only add this to the LAST hidden state of the LLM as all the layers
-up to that are just building context into that final hidden state and all we are doing is 
-adding more context which is naturally cumulated in the final hidden state.
+Our output layer is the final projection from our integration layer back to our model's hidden state
+dimension. This will then be passed into a Monosynaptic Injector (MSI) layers to be integrated with
+the LLM's processing.
 """
 class OutputLayer(nn.Module):
     def __init__(self, model_dim, int_dim):
         super().__init__()
 
         self.lin = nn.Linear(int_dim, model_dim) #model_dim is model embedding dim (2048 in tinyllama)
-        self.lin_gate = nn.Linear(int_dim, 1)
         self.nonlin = nn.SiLU()
 
     def forward(self, int_mem):
 
-        gate = self.lin_gate(int_mem)
         mem = self.lin(int_mem)
         mem_final = self.nonlin(mem)
 
-        return mem_final, gate
+        return mem_final
 
+
+"""
+Monosynaptic Injection Layer (MSI Layer)
+
+This layer is meant to mimic the brain's integration of memory signals from the hippocampus to 
+the prefrontal cortex via monosynaptic connections. We use the hidden state of our LLM and the 
+final memory output of our AH and gated addition with Feature-wise Linear Modulation (FiLM) to
+control integration and allow the model to learn to utilize our memory's output.
+
+We will use these layers to augment the hidden state of intermediate layers (19-22) in our LLM. This will allows the LLM to learn to use memory signals when it wants and process them alongside the rest
+of the query context it has from previous layers.
+"""
+
+class MonosynapticInjector(nn.Module):
+    def __init__(self, hidden_dim=2048, mem_dim=2048, use_film=True ):
+        super().__init__()
+
+        self.hidden_dim = hidden_dim
+        self.mem_dim = mem_dim
+        self.use_film = use_film
+
+        self.mem_proj = nn.Sequential(
+            nn.Linear(self.mem_dim, self.hidden_dim),
+            nn.SiLU()
+        )
+
+        self.gate_dim = hidden_dim + mem_dim
+
+        self.gate_net = nn.Sequential(
+            nn.Linear(self.gate_dim, self.hidden_dim // 4),
+            nn.SiLU(),
+            nn.Linear(self.hidden_dim // 4, 1)
+        )
+
+        self.alpha = nn.Parameter(torch.tensor(0.1))
+        """
+        Feature-wise Linear Modulation will perform scaling and shifting of each feature, allowing
+        the model to modulate each feature of the memory-injected hidden state.
+        """
+        self.film = nn.Sequential(
+            nn.Linear(self.hidden_dim, self.hidden_dim * 2),
+            nn.SiLU(),
+            nn.Linear(self.hidden_dim * 2, self.hidden_dim * 2)
+        )
+
+        self.norm = nn.LayerNorm(self.hidden_dim)
+    
+    def forward(self, hidden_state, mem_final):
+
+        B, L, H = hidden_state.shape
+        mem_vec = self.mem_proj(mem_final)
+
+        h_pool = hidden_state.mean(dim=1)
+        gate_in = torch.cat([h_pool, mem_vec], dim=-1)
+
+        gate_logits = self.gate_net(gate_in)
+        gate = torch.sigmoid(gate_logits).view(B, 1, 1)
+
+        mem_exp = mem_vec.unsqueeze(1).view(B, L, H)
+
+        injected = hidden_state + self.alpha * gate * mem_exp
+
+        if self.use_film:
+            film_params = self.film(mem_final)
+            gamma, beta = film_params.chunk(2, dim=-1)
+            gamma = gamma.unsqueeze(1)
+            beta = beta.unsqueeze(1)
+            injected = gamma * injected + beta
+
+        return self.norm(injected) 
 
 
 @dataclass
@@ -403,7 +408,7 @@ class AH_Args:
     num_latents = 8
     latent_size = 256
     num_layers = 2
-    storage_dim = num_latents * latent_size + stage_2_context_dim
+    storage_dim = num_latents * latent_size
     retrieval_dim = z_dim
     vae_dim = 512
     int_dim = ent_dim
@@ -411,61 +416,216 @@ class AH_Args:
 
 
 
-class EMN(nn.Module):
-    def __init__(self, pfc, args:AH_Args):
+class AH(nn.Module):
+    def __init__(self, args:AH_Args):
         super().__init__()
-        self.pfc = pfc
         self.args = args
+
+        self.familiarity_store = FamiliarityStorage(args.proj_dim)
 
         self.entorhinal = EntorhinalLayer(args.proj_dim, args.ent_dim)
         self.compression = CompressionLayer(args.ent_dim, args.expansion, args.k)
         self.stage_1 = Stage1(args.z_dim, args.embd_dim, args.stage_1_hidden)
         self.stage_2 = Stage2(args.z_dim, args.stage_2_context_dim, args.num_latents, args.latent_size, args.num_layers)
-        self.ltm = SAE_LTM(args.storage_dim, args.retrieval_dim, args)
+        self.ltm = SAE_LTM(args.storage_dim, args.retrieval_dim)
         self.integration = IntegrationLayer(args.z_dim, args.ent_dim, args.vae_dim)
         self.output = OutputLayer(args.embd_dim, args.int_dim)
         
         self.stage_2_buffer = []
 
-    def storage(self, prompt):
-
-        pfc_out = self.pfc(prompt)
-        pfc_hidden_state = pfc_out['last_hidden_state']
-        target_layer = model.base_model.base_model.layers[-1].self_attn
-        hook_handle = target_layer.register_forward_hook(hook_func)
-
-        ent_out = self.entorhinal(pfc_out['projected_output'])
-        z_sparse = self.compression(ent_out)
+    def storage(self, query, captured_kv, consolidation=False):
+        familiarity = self.familiarity_store(query)
+        ent_out = self.entorhinal(query)
+        z_sparse = self.compression(ent_out, familiarity)
 
         high_recon, context_embed = self.stage_1(z_sparse, captured_kv['k'], captured_kv['v']) 
         stage_2_input = { 'z_sparse': z_sparse, 'context': context_embed} #store in some buffer until offline consolidation
         self.stage_2_buffer.append(stage_2_input)
 
-        #TIME FOR OFFLINE CONSOLIDATION
-        #loop through and concat z_sparse and context for each stored memory
+        if consolidation:
+            #TIME FOR OFFLINE CONSOLIDATION
+            #loop through and concat z_sparse and context for each stored memory
 
-        #run each through stage 2
-        for input in self.stage_2_buffer:
-            latents = self.stage_2(input['z_sparse'], input['context']) #[Batch, num_latents, latent_size]
-            latent_full = torch.stack(latents)
-            memory_trace = torch.cat[latent_full, input['z_sparse']]
-            sae_recon = self.ltm(memory_trace, 0)
+            #run each through stage 2
+            for input in self.stage_2_buffer:
+                latents = self.stage_2(input['z_sparse'], input['context']) #[Batch, num_latents, latent_size]
+                latent_full = torch.stack(latents)
+                sae_recon, loss_sparse = self.ltm(latent_full, 0)
 
-    def retrieve(self, prompt):
-        pfc_out = self.pfc(prompt)
-        ent_out = self.entorhinal(pfc_out['projected_output'])
-        z_sparse = self.compression(ent_out)
+    def retrieve(self, query):
+        
+        #NEED TO ADD RETRIEVAL FAMILIARITY
+        familiary = torch.tensor(0.0)
+        ent_out = self.entorhinal(query)
+        z_sparse = self.compression(ent_out, familiary)
 
-        sae_out = self.ltm(z_sparse, 1)
+        sae_out, loss_sparse = self.ltm(z_sparse, 1)
         int_out = self.integration(z_sparse, ent_out, sae_out)
-        final, gate = self.output(int_out)
+        final = self.output(int_out)
 
-        #Do something with gate to check retrieval utility/confidence
-        #add back to LLM hidden state
-
+        return final
 
 
-model = PFC()
+class LlamaWithAH(nn.Module):
+    def __init__(
+        self,
+        base_model_name: str,
+        ah_module: AH,
+        args: AH_Args,
+        inject_layers,
+        pause_layer: int = 19,
+        device: torch.device = None,
+        
+    ):
+        """
+        pause_layer: layer index (1-based) at which we pause BEFORE executing that layer.
+                     e.g., pause_layer=19 => run layers 0-18, then pause
+        inject_layers: list of 0-based layer indices where MSI will be applied (after that layer's output)
+        """
+        super().__init__()
+        self.device = device or torch.device("cpu")
+        self.base = AutoModelForCausalLM.from_pretrained(base_model_name).to(self.device)
+        self.transformer = self.base.model  
+        self.hidden_size = self.base.config.hidden_size
+
+        self.pause_layer = pause_layer
+        self.inject_layers = inject_layers
+
+        self.captured_kv = {}
+
+        self.target_layer = self.transformer.layers[self.pause_layer - 1].self_attn
+        self.hook_handle = self.target_layer.register_forward_hook(self.hook_func)
+
+        self.query_attention = nn.MultiheadAttention(self.hidden_size, num_heads=8, batch_first=True)
+        self.query_token = nn.Parameter(torch.randn(1,1,self.hidden_size))
+
+        # Projection head (from last-token hidden state at pause -> AH query)
+        self.projection_head = ProjectionHead(input_dim=self.hidden_size, output_dim=args.proj_dim).to(self.device)
+
+        # AH module (user-provided) must implement retrieve_from_query(q) -> [B, hidden_size]
+        self.ah = ah_module.to(self.device)
+
+        # MSI modules for each injection layer
+        self.msi_layers = nn.ModuleDict({
+            str(l): MonosynapticInjector(hidden_dim=self.hidden_size, mem_dim=self.hidden_size).to(self.device)
+            for l in self.inject_layers
+        })
+
+    def hook_func(self, module, input, output):
+        hidden_states = output[0] #hidden_states: [1, 3, 2048]
+
+        batch_size, sequence_len, _ = hidden_states.shape
+
+        # project to K/V manually using module's weights
+        k_proj = module.k_proj(hidden_states) #k_proj: [1, 3, 256] 
+        v_proj = module.v_proj(hidden_states) #v_proj: [1, 3, 256]
+        
+        _, _, proj_dim = k_proj.shape
+        """
+        our embd_dim is 2048, our head dim is 64, and we have 32 heads, so we would expect this to be 
+        64, but to speed up inference, they have the model have 4 key and value heads, with 32 query heads. So this results in our key and value projections being query_head_dim * 4, 256.
+        """
+
+        num_q_heads = module.num_heads #32
+        
+        q_head_dim = module.head_dim #64 (embd_dim: 2048 / num_head: 32 = 64)
+        num_kv_heads = proj_dim // q_head_dim
+
+
+        k = k_proj.view(batch_size, sequence_len, num_kv_heads, q_head_dim).transpose(1, 2) #pre-transpose: [1, 3, 4, 64] post: [1, 4, 3, 64]
+        v = v_proj.view(batch_size, sequence_len, num_kv_heads, q_head_dim).transpose(1, 2)
+        #pre-transpose: [1, 3, 4, 64] post: [1, 4, 3, 64]
+
+        self.captured_kv['k'] = k.detach()
+        self.captured_kv['v'] = v.detach()
+
+    def group_query(self, hidden_states):
+        B, L, H = hidden_states.shape
+
+        query = self.query_token.expand(B, -1, -1) #[Batch, 1, Hidden]
+
+        attn_output, _ = self.query_attention(
+            query = query,
+            key = hidden_states,
+            value = hidden_states
+        )
+
+        pooled = attn_output.squeeze(1)
+
+        return pooled #[B, H]
+        
+
+
+    def forward(self, input_ids: torch.LongTensor, attention_mask: torch.Tensor = None):
+        """
+        Runs: embed -> layers 0..pause_layer-1 -> pause & AH retrieval -> continue layers ->
+        apply MSI at inject_layers -> final norm & lm_head -> logits
+        """
+        B = input_ids.shape[0]
+
+        # embeddings (use underlying model's embedding)
+        hidden_states = self.transformer.embed_tokens(input_ids).to(self.device)  # [B, L, H]
+
+        # iterate transformer layers manually
+        num_layers = len(self.transformer.layers)
+        # run layers up to pause_layer-1 inclusive
+        for i, layer in enumerate(self.transformer.layers):
+            hidden_states = layer(hidden_states, attention_mask=attention_mask)[0]
+
+            # if we've reached the layer before pause_layer, stop and retrieve
+            if (i + 1) == self.pause_layer:
+                query_pre = self.group_query(hidden_states)
+                # project to AH query dim
+                query = self.projection_head(query_pre)  # [B, q_dim]
+                # Synchronous AH retrieval
+                mem_vec = self.ah.retrieve(query)  # should be [B, H]
+                # ensure mem_vec on same device and dtype
+                mem_vec = mem_vec.to(hidden_states.device).type(hidden_states.dtype)
+                # break out and continue from this exact hidden_states
+                # note: do not apply MSI here
+                break
+        else:
+            # if pause_layer is beyond final layer, handle gracefully
+            mem_vec = torch.zeros(B, self.hidden_size, device=hidden_states.device, dtype=hidden_states.dtype)
+
+        # Now continue remaining layers (from i+1 ... end)
+        start_idx = i + 1
+        for j in range(start_idx, num_layers):
+            layer = self.transformer.layers[j]
+            hidden_states = layer(hidden_states, attention_mask=attention_mask)[0]
+
+            # apply MSI after this layer if configured
+            if j in self.inject_layers:
+                hidden_states = self.msi_layers[str(j)](hidden_states, mem_vec)
+
+        # final layer norm & lm head (use base model's heads)
+        hidden_states = self.transformer.norm(hidden_states)
+        logits = self.base.lm_head(hidden_states)
+
+        return logits
+
+    # convenience method: decode via base tokenizer/generate without memory integration (use with care)
+    def generate_with_memory(self, input_ids, attention_mask=None, **gen_kwargs):
+        # You need a custom generation loop to integrate AH at each step.
+        # For now this delegates to base generate (no AH integration). Use only for testing.
+        return self.base.generate(input_ids=input_ids, attention_mask=attention_mask, **gen_kwargs)
+    
+    def __del__(self):
+        if hasattr(self, 'hook_handle'):
+            self.hook_handle.remove()
+
+
+args = AH_Args()
+ah = AH(args)
+
+device = 'cuda' if torch.cuda.is_available() else 'cpu'
+
+model = LlamaWithAH(
+    base_model_name="TinyLlama/TinyLlama-1.1B-intermediate-step-1431k-3T",
+    ah_module=ah,
+    inject_layers=[19,20,21,22],
+    device=device
+    )
 
 
 model_outputs = model(inputs.input_ids)
