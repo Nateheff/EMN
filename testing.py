@@ -1,33 +1,13 @@
 from transformers import AutoTokenizer, AutoModelForCausalLM
+from transformers.modeling_attn_mask_utils import _create_4d_causal_attention_mask
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
+from torch.utils.data import DataLoader
+from datasets import load_dataset
 from dataclasses import dataclass
-
-
-tokenizer = AutoTokenizer.from_pretrained("TinyLlama/TinyLlama-1.1B-intermediate-step-1431k-3T")
-# model = AutoModelForCausalLM.from_pretrained("TinyLlama/TinyLlama-1.1B-intermediate-step-1431k-3T")
-tokenizer.padding_side = 'right'
-tokenizer.add_special_tokens({'pad_token': tokenizer.eos_token})
-
-prompts = [
-    "Hello, can you talk to me?",
-    "What is the capital of France?",
-    "I'm sad",
-    "What are the seven days of the week?",
-    "Hello",
-    "I really like ice cream"
-    ]
-
-prompt = "Hello."
-# inputs = tokenizer(prompts, padding=True, truncation=True, return_tensors='pt')
-inputs = tokenizer(prompt, return_tensors='pt')
-
-
-
-
-
+from data import *
 
 
 """
@@ -109,7 +89,7 @@ def kWTA(input, k):
     # topk returns values and indices, we need the k-th value
     # torch.topk returns values in descending order, so the k-th value is at index k-1
     kth_value = torch.topk(input, k, dim=-1)
-    thresh = kth_value[:, -1].unsqueeze(-1)
+    thresh = kth_value.values[:, -1].unsqueeze(-1)
 
     # Create a mask where values greater than or equal to the k-th value are True
     mask = (input >= thresh).to(input.dtype)
@@ -129,15 +109,15 @@ class CompressionLayer(nn.Module):
     def __init__(self, ent_dim, expansion, k=512):
         super().__init__()
 
-        self.input_dim = ent_dim + 1 #Query + familiarity score
+        self.input_dim = ent_dim #WOULD ADD FAMILIARITY HERE
         self.k = k
 
         self.expand = nn.Linear(self.input_dim, ent_dim * expansion)
         self.nonlin = nn.ReLU()
 
-    def forward(self, ent_output, familiarity):
-        ent_fam = torch.cat([ent_output, familiarity], dim=-1)
-        expansion = self.expand(ent_fam)
+    def forward(self, ent_output):
+        
+        expansion = self.expand(ent_output)
         #ReLU begin the pattern separation
         expansion = self.nonlin(expansion)
 
@@ -295,9 +275,18 @@ class IntegrationLayer(nn.Module):
         z_proj = self.proj_z(z_sparse)
         ent_proj = self.proj_ent(h_ent)
 
-        memory = torch.cat([z_sparse, vae_proj], dim=-1)
-        int_mem, _ = self.cross_attn(ent_proj, memory, memory)
+        ent_proj = ent_proj.unsqueeze(1)
+        z_proj = z_proj.unsqueeze(1)
+        vae_proj = vae_proj.unsqueeze(1)
 
+        """
+        Concatenating along dimension 1 allow the attention mechanism to selectively
+        use aspects of both z_proj and vae_proj in the key and value vectors.
+        """
+        memory = torch.cat([z_proj, vae_proj], dim=1)
+        int_mem, _ = self.cross_attn(ent_proj, memory, memory)
+        int_mem = int_mem.squeeze(1)
+        ent_proj = ent_proj.squeeze(1)
         gate = torch.cat([ent_proj, int_mem], dim=-1)
         g = self.gating(self.lin(gate))
 
@@ -382,7 +371,7 @@ class MonosynapticInjector(nn.Module):
         gate_logits = self.gate_net(gate_in)
         gate = torch.sigmoid(gate_logits).view(B, 1, 1)
 
-        mem_exp = mem_vec.unsqueeze(1).view(B, L, H)
+        mem_exp = mem_vec.unsqueeze(1)
 
         injected = hidden_state + self.alpha * gate * mem_exp
 
@@ -453,9 +442,9 @@ class AH(nn.Module):
         self.final_output = None
 
     def storage(self, query, captured_kv, consolidation=False):
-        familiarity = self.familiarity_store(query)
+        
         ent_out = self.entorhinal(query)
-        z_sparse = self.compression(ent_out, familiarity)
+        z_sparse = self.compression(ent_out)
         
         self.stage1_input = z_sparse
         high_recon, context_embed = self.stage_1(z_sparse, captured_kv['k'], captured_kv['v']) 
@@ -479,10 +468,8 @@ class AH(nn.Module):
 
     def retrieve(self, query):
         
-        #NEED TO ADD RETRIEVAL FAMILIARITY
-        familiary = torch.tensor(0.0)
         ent_out = self.entorhinal(query)
-        z_sparse = self.compression(ent_out, familiary)
+        z_sparse = self.compression(ent_out)
 
         sae_out, loss_sparse = self.ltm(z_sparse, 1)
         int_out = self.integration(z_sparse, ent_out, sae_out)
@@ -499,7 +486,7 @@ class LlamaWithAH(nn.Module):
         ah_module: AH,
         args: AH_Args,
         inject_layers,
-        pause_layer: int = 19,
+        pause_layer: int = 15,
         device: torch.device = None,
         
     ):
@@ -509,6 +496,7 @@ class LlamaWithAH(nn.Module):
         inject_layers: list of 0-based layer indices where MSI will be applied (after that layer's output)
         """
         super().__init__()
+        
         self.device = device or torch.device("cpu")
         self.base = AutoModelForCausalLM.from_pretrained(base_model_name).to(self.device)
         self.transformer = self.base.model  
@@ -548,8 +536,9 @@ class LlamaWithAH(nn.Module):
         
         _, _, proj_dim = k_proj.shape
         """
-        our embd_dim is 2048, our head dim is 64, and we have 32 heads, so we would expect this to be 
-        64, but to speed up inference, they have the model have 4 key and value heads, with 32 query heads. So this results in our key and value projections being query_head_dim * 4, 256.
+        our embd_dim is 2048, our head dim is 64, and we have 32 heads, so we would expect this to be  64, but to speed up inference, they have the model have 4 key and value heads, with 32 query heads. So this results in our key and value projections being query_head_dim * 4, 256.
+        As we would expect, when you look at the docs of the model, in the decoder layers, their key
+        and query vectors are of length 256 and their query is 2048.
         """
 
         num_q_heads = module.num_heads #32
@@ -582,21 +571,34 @@ class LlamaWithAH(nn.Module):
         
 
 
-    def forward(self, input_ids: torch.LongTensor, attention_mask: torch.Tensor = None):
+    def forward(self, input_ids: torch.LongTensor):
         """
         Runs: embed -> layers 0..pause_layer-1 -> pause & AH retrieval -> continue layers ->
         apply MSI at inject_layers -> final norm & lm_head -> logits
         """
-        B = input_ids.shape[0]
+        B, seq_len = input_ids.shape
 
         # embeddings (use underlying model's embedding)
         hidden_states = self.transformer.embed_tokens(input_ids).to(self.device)  # [B, L, H]
 
+        B, L, H = hidden_states.shape
+        device = hidden_states.device
+        dtype = hidden_states.dtype
+
+        # Create an attention mask of dimension [Batch, 1, L, L]
+        causal_mask = _create_4d_causal_attention_mask(input_shape=[B,L], device=device, dtype=dtype)
+        
+        position_ids = torch.arange(0, L, device=device).unsqueeze(0).expand(B, L).long()  # [B, L]
         # iterate transformer layers manually
         num_layers = len(self.transformer.layers)
+
+        mem_vec = None
+              
         # run layers up to pause_layer-1 inclusive
         for i, layer in enumerate(self.transformer.layers):
-            hidden_states = layer(hidden_states, attention_mask=attention_mask)[0]
+            
+            layer_output = layer(hidden_states, attention_mask=causal_mask, position_ids=position_ids)
+            hidden_states = layer_output[0]
 
             # if we've reached the layer before pause_layer, stop and retrieve
             if (i + 1) == self.pause_layer:
@@ -606,19 +608,18 @@ class LlamaWithAH(nn.Module):
                 # Synchronous AH retrieval
                 mem_vec = self.ah.retrieve(query)  # should be [B, H]
                 # ensure mem_vec on same device and dtype
-                mem_vec = mem_vec.to(hidden_states.device).type(hidden_states.dtype)
+                mem_vec = mem_vec.to(device).type(dtype)
                 # break out and continue from this exact hidden_states
                 # note: do not apply MSI here
                 break
-        else:
-            # if pause_layer is beyond final layer, handle gracefully
-            mem_vec = torch.zeros(B, self.hidden_size, device=hidden_states.device, dtype=hidden_states.dtype)
+
 
         # Now continue remaining layers (from i+1 ... end)
         start_idx = i + 1
         for j in range(start_idx, num_layers):
             layer = self.transformer.layers[j]
-            hidden_states = layer(hidden_states, attention_mask=attention_mask)[0]
+            layer_outputs = layer(hidden_states, attention_mask=causal_mask, position_ids=position_ids)
+            hidden_states = layer_outputs[0]
 
             # apply MSI after this layer if configured
             if j in self.inject_layers:
@@ -631,27 +632,27 @@ class LlamaWithAH(nn.Module):
         return logits
 
     # convenience method: decode via base tokenizer/generate without memory integration (use with care)
-    def generate_with_memory(self, input_ids, attention_mask=None, **gen_kwargs):
+    def generate_with_memory(self, input_ids, max_new_tokens=256):
         # You need a custom generation loop to integrate AH at each step.
         # For now this delegates to base generate (no AH integration). Use only for testing.
-        return self.base.generate(input_ids=input_ids, attention_mask=attention_mask, **gen_kwargs)
+        for _ in range(max_new_tokens):
+            logits = self(input_ids)
+            logits = logits[:, -1, :]
+            probs = F.softmax(logits, dim=-1) # (B, C)
+            # sample from the distribution
+            print("PROBS: ",probs[:5])
+
+            idx_next = probs.argmax(dim=-1, keepdim=True) #only take token with highest probability
+            # append sampled index to the running sequence
+            input_ids = torch.cat((input_ids, idx_next), dim=1) # (B, T+1)
+
+        return input_ids
     
     def __del__(self):
         if hasattr(self, 'hook_handle'):
             self.hook_handle.remove()
 
 
-args = AH_Args()
-ah = AH(args)
-
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-
-model = LlamaWithAH(
-    base_model_name="TinyLlama/TinyLlama-1.1B-intermediate-step-1431k-3T",
-    ah_module=ah,
-    inject_layers=[19,20,21,22],
-    device=device
-    )
 
 class AHLoss(nn.Module):
     def __init__(self, lambda_stage1=1.0, lambda_stage2=1.0,
@@ -695,6 +696,20 @@ class AHLoss(nn.Module):
         
 
 def stage_1_training():
+
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+    args = AH_Args()
+    ah = AH(args).to(device)
+
+    model = LlamaWithAH(
+        base_model_name="TinyLlama/TinyLlama-1.1B-intermediate-step-1431k-3T",
+        ah_module=ah,
+        args=args,
+        inject_layers=[15,16,17,18],
+        device=device
+        ).to(device)
+    
     # Freeze LLM weights
     for p in model.base.parameters():
         p.requires_grad = False
@@ -704,8 +719,6 @@ def stage_1_training():
 
     optimizer = optim.AdamW(trainable_params, lr=1e-4)
 
-
-
     loss_fn = AHLoss(
     lambda_stage1=1.0,
     lambda_stage2=1.0,
@@ -713,12 +726,66 @@ def stage_1_training():
     lambda_ah=0.5,
     lambda_lm=0.1  # small weight on LM loss early
     )
-
+    """
+    FIX (Count correctly: numel())
     total_param = len(trainable_params)
     stage1_norm = len(model.ah.stage_1.parameters()) / total_param
     stage2_norm = len(model.ah.stage_2.parameters()) / total_param
     sae_norm = len(model.ah.ltm.parameters()) / total_param
+    """
+    trivia = load_dataset("trivia_qa", "rc.nocontext")
+    dataloader = DataLoader(trivia['train'], batch_size=128)
+    
+    tokenizer = AutoTokenizer.from_pretrained("TinyLlama/TinyLlama-1.1B-intermediate-step-1431k-3T")
+    tokenizer.padding_side = 'right'
+    tokenizer.add_special_tokens({'pad_token': tokenizer.eos_token})
+    
+    
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    # inputs = tokenizer(prompts, padding=True, truncation=True, return_tensors='pt')
+    
+    for batch in dataloader:
+        inputs = preprocess_fn(batch, tokenizer, max_len=256)
 
+        inputs = tokenizer(inputs, return_tensors='pt')
+        input_ids = inputs.input_ids.to(device)
+        attn_mask = inputs.attention_mask.to(device)
+
+        args = AH_Args()
+        ah = AH(args).to(device)
+
+        model = LlamaWithAH(
+            base_model_name="TinyLlama/TinyLlama-1.1B-intermediate-step-1431k-3T",
+            ah_module=ah,
+            args=args,
+            inject_layers=[15,16,17,18],
+            device=device
+            ).to(device)
+        
+        logits = model.forward(input_ids)
+
+        loss = loss_fn(
+            model.ah.stage1_input,
+            model.ah.stage1_recon,
+            model.ah.stage2_input,
+            model.ah.stage2_recon,
+            model.ah.sae_input,
+            model.ah.sae_recon,
+            model.ah.final_output,
+            stage1_norm,
+            stage2_norm,
+            sae_norm,
+            ah_target,
+            logits, 
+            targets
+            )
+        
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+        
+        print(f"loss: {loss.item():.4f}")
+    """
     for batch in dataloader:
         input_ids = batch["input_ids"].to(device)
         labels = batch["labels"].to(device)
@@ -752,7 +819,51 @@ def stage_1_training():
         optimizer.step()
 
     print(f"loss: {loss.item():.4f}")
+"""
 
+def test():
+    
+    tokenizer = AutoTokenizer.from_pretrained("TinyLlama/TinyLlama-1.1B-intermediate-step-1431k-3T")
+    # model = AutoModelForCausalLM.from_pretrained("TinyLlama/TinyLlama-1.1B-intermediate-step-1431k-3T")
+    tokenizer.padding_side = 'right'
+    tokenizer.add_special_tokens({'pad_token': tokenizer.eos_token})
+
+    prompts = [
+        "Hello, can you talk to me?",
+        "What is the capital of France?",
+        "I'm sad",
+        "What are the seven days of the week?",
+        "Hello",
+        "I really like ice cream"
+        ]
+
+    prompt = "Hello."
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    # inputs = tokenizer(prompts, padding=True, truncation=True, return_tensors='pt')
+    inputs = tokenizer(prompt, return_tensors='pt')
+    input_ids = inputs.input_ids.to(device)
+    attn_mask = inputs.attention_mask.to(device)
+
+    args = AH_Args()
+    ah = AH(args).to(device)
+
+    model = LlamaWithAH(
+        base_model_name="TinyLlama/TinyLlama-1.1B-intermediate-step-1431k-3T",
+        ah_module=ah,
+        args=args,
+        inject_layers=[15,16,17,18],
+        device=device
+        ).to(device)
+    
+    generation = model.generate_with_memory(input_ids, max_new_tokens=20)
+
+    decode = tokenizer.batch_decode(generation, skip_special_tokens=True)
+    print(decode)
+
+
+
+if __name__ == "__main__":
+    stage_1_training()
 
 # output = tokenizer.batch_decode(generate_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)
 # print(output)

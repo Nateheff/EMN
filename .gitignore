@@ -1,2 +1,3 @@
 .venv*
 legacy.py
+data.py
