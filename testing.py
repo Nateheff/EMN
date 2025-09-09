@@ -2,6 +2,7 @@ from transformers import AutoTokenizer, AutoModelForCausalLM
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.optim as optim
 from dataclasses import dataclass
 
 
@@ -431,16 +432,37 @@ class AH(nn.Module):
         self.integration = IntegrationLayer(args.z_dim, args.ent_dim, args.vae_dim)
         self.output = OutputLayer(args.embd_dim, args.int_dim)
         
+
+
+        #NOTE: We have these spread throughout, and they are (for the most part) WRONG! When we need 
+        # to be calculating these recon losses online for stage 1 and SAE. 
+
+
+
+        self.stage1_input = None
+        self.stage1_recon = None
+
+        self.stage2_input = None
+        self.stage2_recon = None
+
+        self.sae_input = None
+        self.sae_recon = None
+        
         self.stage_2_buffer = []
+
+        self.final_output = None
 
     def storage(self, query, captured_kv, consolidation=False):
         familiarity = self.familiarity_store(query)
         ent_out = self.entorhinal(query)
         z_sparse = self.compression(ent_out, familiarity)
-
+        
+        self.stage1_input = z_sparse
         high_recon, context_embed = self.stage_1(z_sparse, captured_kv['k'], captured_kv['v']) 
-        stage_2_input = { 'z_sparse': z_sparse, 'context': context_embed} #store in some buffer until offline consolidation
-        self.stage_2_buffer.append(stage_2_input)
+        self.stage1_recon = high_recon
+
+        self.stage2_input = { 'z_sparse': z_sparse, 'context': context_embed} #store in some buffer until offline consolidation
+        self.stage_2_buffer.append(self.stage2_input)
 
         if consolidation:
             #TIME FOR OFFLINE CONSOLIDATION
@@ -450,7 +472,10 @@ class AH(nn.Module):
             for input in self.stage_2_buffer:
                 latents = self.stage_2(input['z_sparse'], input['context']) #[Batch, num_latents, latent_size]
                 latent_full = torch.stack(latents)
+                self.stage2_recon = latent_full
+                self.sae_input = latent_full
                 sae_recon, loss_sparse = self.ltm(latent_full, 0)
+                self.sae_recon = sae_recon
 
     def retrieve(self, query):
         
@@ -462,6 +487,7 @@ class AH(nn.Module):
         sae_out, loss_sparse = self.ltm(z_sparse, 1)
         int_out = self.integration(z_sparse, ent_out, sae_out)
         final = self.output(int_out)
+        self.final_output = final
 
         return final
 
@@ -618,7 +644,7 @@ class LlamaWithAH(nn.Module):
 args = AH_Args()
 ah = AH(args)
 
-device = 'cuda' if torch.cuda.is_available() else 'cpu'
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 model = LlamaWithAH(
     base_model_name="TinyLlama/TinyLlama-1.1B-intermediate-step-1431k-3T",
@@ -627,8 +653,107 @@ model = LlamaWithAH(
     device=device
     )
 
+class AHLoss(nn.Module):
+    def __init__(self, lambda_stage1=1.0, lambda_stage2=1.0,
+                 lambda_sae=1.0, lambda_ah=1.0, lambda_lm=0.0):
+        super().__init__()
+        self.l1 = lambda_stage1
+        self.l2 = lambda_stage2
+        self.ls = lambda_sae
+        self.la = lambda_ah
+        self.ll = lambda_lm
 
-model_outputs = model(inputs.input_ids)
+        self.mse = nn.MSELoss()
+
+    def forward(self, stage1_in, stage1_recon, stage2_in, stage2_recon, sae_in, sae_recon, ah_output, stage1_norm, stage2_norm, sae_norm, ah_target=None, lm_logits=None, lm_labels=None):
+
+        loss = 0.0
+
+        if stage1_in is not None and stage1_recon is not None:
+            loss += self.l1 * self.mse(stage1_recon, stage1_in) * stage1_norm
+        
+        if stage2_in is not None and stage2_recon is not None:
+            loss += self.l2 * self.mse(stage2_recon, stage2_in) * stage2_norm
+
+        if sae_in is not None and sae_recon is not None:
+            loss += self.ls * self.mse(sae_recon, sae_in) * sae_norm
+
+        # AH/global loss
+        if ah_target is not None:
+            loss += self.la * self.mse(ah_output, ah_target)
+
+        # optional LLM cross-entropy
+        if lm_logits is not None and lm_labels is not None:
+            ce_loss = F.cross_entropy(
+                lm_logits.view(-1, lm_logits.size(-1)),
+                lm_labels.view(-1),
+                ignore_index=-100
+            )
+            loss += self.ll * ce_loss
+
+        return loss
+        
+
+def stage_1_training():
+    # Freeze LLM weights
+    for p in model.base.parameters():
+        p.requires_grad = False
+
+    # Collect trainable params (AH + MSI)
+    trainable_params = list(model.ah.parameters()) + list(model.msi_layers.parameters()) + list(model.projection_head.parameters())
+
+    optimizer = optim.AdamW(trainable_params, lr=1e-4)
+
+
+
+    loss_fn = AHLoss(
+    lambda_stage1=1.0,
+    lambda_stage2=1.0,
+    lambda_sae=1.0,
+    lambda_ah=0.5,
+    lambda_lm=0.1  # small weight on LM loss early
+    )
+
+    total_param = len(trainable_params)
+    stage1_norm = len(model.ah.stage_1.parameters()) / total_param
+    stage2_norm = len(model.ah.stage_2.parameters()) / total_param
+    sae_norm = len(model.ah.ltm.parameters()) / total_param
+
+    for batch in dataloader:
+        input_ids = batch["input_ids"].to(device)
+        labels = batch["labels"].to(device)
+        attention_mask = batch["attention_mask"].to(device)
+
+        # Forward pass
+        outputs = model.forward(input_ids, attention_mask=attention_mask)
+
+        # Unpack intermediate outputs from your AH
+        stage1_in, stage1_recon = model.ah.stage1_inputs, model.ah.stage1_recons
+        stage2_in, stage2_recon = model.ah.stage2_inputs, model.ah.stage2_recons
+        sae_in, sae_recon = model.ah.sae_inputs, model.ah.sae_recons
+        ah_out = model.ah.final_output
+
+        # Logits from LLM (already returned)
+        lm_logits = outputs
+        lm_labels = labels
+
+        # Compute total loss
+        loss = loss_fn(
+            stage1_in, stage1_recon,
+            stage2_in, stage2_recon,
+            sae_in, sae_recon,
+            ah_out, ah_target=None,  # optional
+            lm_logits=lm_logits, lm_labels=lm_labels
+        )
+
+        # Backward
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+
+    print(f"loss: {loss.item():.4f}")
+
+
 # output = tokenizer.batch_decode(generate_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)
 # print(output)
 
