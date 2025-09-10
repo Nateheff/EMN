@@ -483,6 +483,7 @@ class LlamaWithAH(nn.Module):
     def __init__(
         self,
         base_model_name: str,
+        tokenizer,
         ah_module: AH,
         args: AH_Args,
         inject_layers,
@@ -499,6 +500,7 @@ class LlamaWithAH(nn.Module):
         
         self.device = device or torch.device("cpu")
         self.base = AutoModelForCausalLM.from_pretrained(base_model_name).to(self.device)
+        self.tokenizer = tokenizer
         self.transformer = self.base.model  
         self.hidden_size = self.base.config.hidden_size
 
@@ -586,8 +588,9 @@ class LlamaWithAH(nn.Module):
         dtype = hidden_states.dtype
 
         # Create an attention mask of dimension [Batch, 1, L, L]
-        causal_mask = _create_4d_causal_attention_mask(input_shape=[B,L], device=device, dtype=dtype)
-        
+        # causal_mask = create_answer_only_mask(input_ids, tokenizer, device=device, dtype=dtype)
+        attention_mask = create_answer_only_mask(input_ids, self.tokenizer, device, dtype)
+
         position_ids = torch.arange(0, L, device=device).unsqueeze(0).expand(B, L).long()  # [B, L]
         # iterate transformer layers manually
         num_layers = len(self.transformer.layers)
@@ -597,7 +600,7 @@ class LlamaWithAH(nn.Module):
         # run layers up to pause_layer-1 inclusive
         for i, layer in enumerate(self.transformer.layers):
             
-            layer_output = layer(hidden_states, attention_mask=causal_mask, position_ids=position_ids)
+            layer_output = layer(hidden_states, attention_mask=attention_mask, position_ids=position_ids)
             hidden_states = layer_output[0]
 
             # if we've reached the layer before pause_layer, stop and retrieve
@@ -618,7 +621,7 @@ class LlamaWithAH(nn.Module):
         start_idx = i + 1
         for j in range(start_idx, num_layers):
             layer = self.transformer.layers[j]
-            layer_outputs = layer(hidden_states, attention_mask=causal_mask, position_ids=position_ids)
+            layer_outputs = layer(hidden_states, attention_mask=attention_mask, position_ids=position_ids)
             hidden_states = layer_outputs[0]
 
             # apply MSI after this layer if configured
@@ -697,13 +700,19 @@ class AHLoss(nn.Module):
 
 def stage_1_training():
 
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    # device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    device = 'cpu'
+
+    tokenizer = AutoTokenizer.from_pretrained("TinyLlama/TinyLlama-1.1B-intermediate-step-1431k-3T")
+    tokenizer.padding_side = 'right'
+    tokenizer.add_special_tokens({'pad_token': tokenizer.eos_token})
 
     args = AH_Args()
     ah = AH(args).to(device)
 
     model = LlamaWithAH(
         base_model_name="TinyLlama/TinyLlama-1.1B-intermediate-step-1431k-3T",
+        tokenizer=tokenizer,
         ah_module=ah,
         args=args,
         inject_layers=[15,16,17,18],
@@ -734,33 +743,30 @@ def stage_1_training():
     sae_norm = len(model.ah.ltm.parameters()) / total_param
     """
     trivia = load_dataset("trivia_qa", "rc.nocontext")
-    dataloader = DataLoader(trivia['train'], batch_size=128)
+    trivia = load_dataset("trivia_qa", "rc.nocontext")  # "rc" = reading comprehension version
+
+
+    # Access splits
+    train_data = trivia["train"]
+
+    train_data = train_data.remove_columns(['question_id', 'question_source', 'entity_pages', 'search_results'])
+    questions = train_data['question']
+    answers = train_data['answer']
+    answers = [answer['value'] for answer in answers]
+
+
+    dset = Stage1_Dataset(questions, answers, ' Answer:')
+    dataloader = DataLoader(dset, batch_size=128)
     
-    tokenizer = AutoTokenizer.from_pretrained("TinyLlama/TinyLlama-1.1B-intermediate-step-1431k-3T")
-    tokenizer.padding_side = 'right'
-    tokenizer.add_special_tokens({'pad_token': tokenizer.eos_token})
-    
-    
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    # device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     # inputs = tokenizer(prompts, padding=True, truncation=True, return_tensors='pt')
     
     for batch in dataloader:
-        inputs = preprocess_fn(batch, tokenizer, max_len=256)
-
-        inputs = tokenizer(inputs, return_tensors='pt')
+        # inputs = preprocess_fn(batch, tokenizer, max_len=256)
+        inputs = tokenizer(batch, truncation=True, padding=True, return_tensors='pt', max_length=128)
         input_ids = inputs.input_ids.to(device)
-        attn_mask = inputs.attention_mask.to(device)
+        # attn_mask = inputs.attention_mask.to(device)
 
-        args = AH_Args()
-        ah = AH(args).to(device)
-
-        model = LlamaWithAH(
-            base_model_name="TinyLlama/TinyLlama-1.1B-intermediate-step-1431k-3T",
-            ah_module=ah,
-            args=args,
-            inject_layers=[15,16,17,18],
-            device=device
-            ).to(device)
         
         logits = model.forward(input_ids)
 
@@ -842,13 +848,14 @@ def test():
     # inputs = tokenizer(prompts, padding=True, truncation=True, return_tensors='pt')
     inputs = tokenizer(prompt, return_tensors='pt')
     input_ids = inputs.input_ids.to(device)
-    attn_mask = inputs.attention_mask.to(device)
+    
 
     args = AH_Args()
     ah = AH(args).to(device)
 
     model = LlamaWithAH(
         base_model_name="TinyLlama/TinyLlama-1.1B-intermediate-step-1431k-3T",
+        tokenizer=tokenizer,
         ah_module=ah,
         args=args,
         inject_layers=[15,16,17,18],
