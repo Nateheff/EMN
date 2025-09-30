@@ -8,6 +8,7 @@ from torch.utils.data import DataLoader
 from datasets import load_dataset
 from dataclasses import dataclass
 from data import *
+import math
 
 
 """
@@ -68,7 +69,9 @@ class FamiliarityStorage(nn.Module):
         self.lin = nn.Linear(query_dim, 1)
 
     def forward(self, query):
-        return self.lin(query)
+        score = self.lin(query)
+        score = 1.0 / torch.exp(score)
+        return score #High score means unfamiliar
     
 
 class FamiliarityRetrieval(nn.Module):
@@ -185,30 +188,51 @@ class Stage1(nn.Module):
     Our Stage 1 will perform cross attention with the Key and Value from the attention block from
     the LLL and we will learn the query.
     """
-    def __init__(self, z_dim, emb_dim, hidden_dim):
+    def __init__(self, ent_dim, proj_dim, hidden_dim):
         super().__init__()
 
-        self.input_proj = nn.Linear(z_dim, emb_dim)
-        self.cross_attn = nn.MultiheadAttention(emb_dim, num_heads=4, batch_first=True)
-        self.ln1 = nn.LayerNorm(emb_dim)
+        self.latent_memory = nn.Parameter(torch.zeros((1,hidden_dim)))
+
+        self.v_proj = nn.Linear(hidden_dim, proj_dim)
+        self.k_proj = nn.Linear(hidden_dim, proj_dim)
+
+        self.q_proj = nn.Linear(ent_dim, proj_dim)
+        self.proj_dim = proj_dim
+
+        #DO WE NEED THIS?
+        self.ln1 = nn.LayerNorm(proj_dim)
         self.mlp = nn.Sequential(
-            nn.Linear(emb_dim, hidden_dim),
+            nn.Linear(proj_dim, hidden_dim),
             nn.SiLU(),
-            nn.Linear(hidden_dim, emb_dim)
+            nn.Linear(hidden_dim, proj_dim)
         )
-        self.ln2 = nn.LayerNorm(emb_dim)
+        self.ln2 = nn.LayerNorm(proj_dim)
 
-    def forward(self, z_sparse, llm_k, llm_v):
+    def forward(self, ent_out):
 
-        z_proj = self.input_proj(z_sparse)
-        attn_out, _ = self.cross_attn(z_proj, llm_k, llm_v)
-        z = self.ln1(z_proj + attn_out) #The vector we store as our Stage 2 context embedding (Might need attn_out[0])
-        mlp_out = self.mlp(z)
-        z_recon = self.ln2(z + mlp_out)
+        """
+        We cross-attend between the latent memory vector and current memory query to extract useful memory information from the 
+        latent memory.
+        In a query pass, we perform a gated update to the latent memory which should perform a very slight update.
+        """
 
-        return z_recon, z
+        v = self.v_proj(self.latent_memory)
+        k = self.k_proj(self.latent_memory)
+
+        q = self.q_proj(ent_out)
+
+        affinities = q @ k.T / math.sqrt(self.proj_dim) #USE THIS TO DECIDE LTM OR NOT
+
+        mem_output = v @ affinities #CHECK DIMS
+
+        #GATED UPDATE OF LATENT MEMORY
+
+
+        return mem_output
     
-
+""" 
+Hypernetwork to transition latent-stored memories to LTM? 
+"""
 
 class SAE_LTM(nn.Module):
     def __init__(self, storage_dim, retrieval_dim, input_dim=512, hidden_dim=4096):
@@ -387,7 +411,7 @@ class MonosynapticInjector(nn.Module):
 
 @dataclass
 class AH_Args:
-    proj_dim = 256
+    proj_dim = 512
     embd_dim = 2048
     ent_dim = 1024
     expansion = 10
@@ -411,16 +435,18 @@ class AH(nn.Module):
         super().__init__()
         self.args = args
 
-        self.familiarity_store = FamiliarityStorage(args.proj_dim)
+        self.familiarity_store = FamiliarityStorage(args.ent_dim)
+        self.stage1_loss = nn.MSELoss()
+        self.recon_thresh = 10
 
         self.entorhinal = EntorhinalLayer(args.proj_dim, args.ent_dim)
         self.compression = CompressionLayer(args.ent_dim, args.expansion, args.k)
-        self.stage_1 = Stage1(args.z_dim, args.embd_dim, args.stage_1_hidden)
+        self.stage_1 = Stage1(args.ent_dim, args.proj_dim, args.stage_1_hidden)
         self.stage_2 = Stage2(args.z_dim, args.stage_2_context_dim, args.num_latents, args.latent_size, args.num_layers)
         self.ltm = SAE_LTM(args.storage_dim, args.retrieval_dim)
         self.integration = IntegrationLayer(args.z_dim, args.ent_dim, args.vae_dim)
         self.output = OutputLayer(args.embd_dim, args.int_dim)
-        
+        self.stage1_optim = optim.AdamW(self.stage_1.parameters(), lr=1e-4)
 
 
         #NOTE: We have these spread throughout, and they are (for the most part) WRONG! When we need 
@@ -441,14 +467,66 @@ class AH(nn.Module):
 
         self.final_output = None
 
+    def froward(self, query, captured_kv):
+
+        ent_out = self.entorhinal(query)
+        fam_score = self.familiarity_store(ent_out)
+        z_sparse = self.compression(ent_out)
+
+        
+        self.stage1_input = z_sparse
+
+        high_recon, context_embed = self.stage_1(z_sparse, captured_kv['k'], captured_kv['v']) 
+        recon_loss = self.stage1_loss(query, high_recon)
+
+        while recon_loss >= self.recon_thresh:
+            self.stage1_optim.zero_grad()
+            recon_loss.backward()
+            self.stage1_optim.step()
+
+            high_recon, context_embed = self.stage_1(z_sparse, captured_kv['k'], captured_kv['v']) 
+            recon_loss = self.stage1_loss(query, high_recon)
+
+
+        self.stage2_input = { 'z_sparse': z_sparse, 'context': context_embed} #store in some buffer until offline consolidation
+        self.stage_2_buffer.append(self.stage2_input)
+
+        if len(self.stage_2_buffer) > 100:
+            #TIME FOR OFFLINE CONSOLIDATION
+            #loop through and concat z_sparse and context for each stored memory
+
+            #run each through stage 2
+            for input in self.stage_2_buffer:
+                latents = self.stage_2(input['z_sparse'], input['context']) #[Batch, num_latents, latent_size]
+                latent_full = torch.stack(latents)
+                self.stage2_recon = latent_full
+                self.sae_input = latent_full
+                sae_recon, loss_sparse = self.ltm(latent_full, 0)
+                self.sae_recon = sae_recon
+
+
     def storage(self, query, captured_kv, consolidation=False):
         
         ent_out = self.entorhinal(query)
+        fam_score = self.familiarity_store(ent_out)
         z_sparse = self.compression(ent_out)
+
         
         self.stage1_input = z_sparse
+        
+        
+
         high_recon, context_embed = self.stage_1(z_sparse, captured_kv['k'], captured_kv['v']) 
-        self.stage1_recon = high_recon
+        recon_loss = self.stage1_loss(query, high_recon)
+
+        while recon_loss >= self.recon_thresh:
+            self.stage1_optim.zero_grad()
+            recon_loss.backward()
+            self.stage1_optim.step()
+
+            high_recon, context_embed = self.stage_1(z_sparse, captured_kv['k'], captured_kv['v']) 
+            recon_loss = self.stage1_loss(query, high_recon)
+
 
         self.stage2_input = { 'z_sparse': z_sparse, 'context': context_embed} #store in some buffer until offline consolidation
         self.stage_2_buffer.append(self.stage2_input)
@@ -469,9 +547,7 @@ class AH(nn.Module):
     def retrieve(self, query):
         
         ent_out = self.entorhinal(query)
-        z_sparse = self.compression(ent_out)
-
-        sae_out, loss_sparse = self.ltm(z_sparse, 1)
+        mem_trace = self.stage_1(ent_out)
         int_out = self.integration(z_sparse, ent_out, sae_out)
         final = self.output(int_out)
         self.final_output = final
@@ -735,13 +811,17 @@ def stage_1_training():
     lambda_ah=0.5,
     lambda_lm=0.1  # small weight on LM loss early
     )
-    """
-    FIX (Count correctly: numel())
-    total_param = len(trainable_params)
-    stage1_norm = len(model.ah.stage_1.parameters()) / total_param
-    stage2_norm = len(model.ah.stage_2.parameters()) / total_param
-    sae_norm = len(model.ah.ltm.parameters()) / total_param
-    """
+
+    total_params = sum(p.numel() for p in trainable_params)
+
+    stage_1_params = sum(p.numel for p in model.ah.stage_1.parameters())
+    stage_2_params = sum(p.numel for p in model.ah.stage_2.parameters())
+    sae_params = sum(p.numel for p in model.ah.ltm.parameters())
+
+    stage1_norm = stage_1_params / total_params
+    stage2_norm = stage_2_params / total_params
+    sae_norm = sae_params / total_params
+
     trivia = load_dataset("trivia_qa", "rc.nocontext")
     trivia = load_dataset("trivia_qa", "rc.nocontext")  # "rc" = reading comprehension version
 
