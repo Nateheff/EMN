@@ -814,9 +814,9 @@ def stage_1_training():
 
     total_params = sum(p.numel() for p in trainable_params)
 
-    stage_1_params = sum(p.numel for p in model.ah.stage_1.parameters())
-    stage_2_params = sum(p.numel for p in model.ah.stage_2.parameters())
-    sae_params = sum(p.numel for p in model.ah.ltm.parameters())
+    stage_1_params = sum(p.numel() for p in model.ah.stage_1.parameters())
+    stage_2_params = sum(p.numel() for p in model.ah.stage_2.parameters())
+    sae_params = sum(p.numel() for p in model.ah.ltm.parameters())
 
     stage1_norm = stage_1_params / total_params
     stage2_norm = stage_2_params / total_params
