@@ -133,7 +133,9 @@ class Stage2(nn.Module):
             for _ in range(num_layers)
         ])
 
-    def forward(self, z_sparse, context_embedding):
+
+
+    def forward(self, z_sparse):
         # Expand latents for batch
         B = z_sparse.size(0)
         latents = self.latents.unsqueeze(0).expand(B, -1, -1)
@@ -156,60 +158,67 @@ class Stage1(nn.Module):
     Our Stage 1 will perform cross attention with the Key and Value from the attention block from
     the LLL and we will learn the query.
     """
-    def __init__(self, ent_dim, proj_dim, hidden_dim, num_latents=4):
+    def __init__(self, ent_dim, proj_dim, hidden_dim, num_latents=64):
         super().__init__()
-
+        self.alpha = 0.01
         self.latent_memory = nn.Parameter(torch.zeros((num_latents,hidden_dim)))
 
         self.v_proj = nn.Linear(hidden_dim, proj_dim)
         self.k_proj = nn.Linear(hidden_dim, proj_dim)
-
         self.q_proj = nn.Linear(ent_dim, proj_dim)
+
         self.proj_dim = proj_dim
 
+        self.llm_k_proj = nn.Linear(hidden_dim, proj_dim)
+        self.llm_v_proj = nn.Linear(hidden_dim, proj_dim)
+
         self.ltm_gate = nn.Sequential(
-            nn.Linear(proj_dim, hidden_dim),
+            nn.Linear(num_latents, hidden_dim),
             nn.ReLU(),
             nn.Linear(hidden_dim, 1),
             nn.Sigmoid()
         )
 
         self.mem_proj = nn.Linear(proj_dim, hidden_dim)
-        self.lin_gate = nn.Linear(hidden_dim, hidden_dim)
-        self.gating = nn.Sigmoid()
-        
         self.ln1 = nn.LayerNorm(proj_dim)
         
 
-    def forward(self, ent_out):
+    def forward(self, ent_out, llm_k, llm_v):
 
         """
         We cross-attend between the latent memory vector and current memory query to extract useful memory information from the 
         latent memory.
         In a query pass, we perform a gated update to the latent memory which should perform a very slight update.
         """
-        B = ent_out.shape[0]
+
+        B, H, L, D_h = llm_k.shape #[batch, heads, query_len, head_dim]
+        llm_k = llm_k.reshape(B, L, H * D_h)
+        llm_v = llm_v.reshape(B, L, H * D_h) #[batch, query_len, hidden_dim]
+
+        llm_k = self.llm_k_proj(llm_k) #[B, query_len, proj_dim]
+        llm_v = self.llm_v_proj(llm_v)
+
         latent = self.latent_memory.unsqueeze(0).expand(B, -1, -1) #[B, num_latents, ent_dim]
-        v = self.v_proj(latent)
+        v = self.v_proj(latent) # [B, num_latents, proj_dim]
         k = self.k_proj(latent)
 
-        q = self.q_proj(ent_out)
+        q = self.q_proj(ent_out) #[B, proj_dim]
 
-        affinities = torch.matmul(q.unsqueeze(1), k.transpose(-1, -2))/ math.sqrt(self.proj_dim) #[128, 1, 4]
-        affinities = affinities.squeeze(1)
+        affinities = torch.matmul(q.unsqueeze(1), k.transpose(-1, -2))/ math.sqrt(self.proj_dim) #[B, 1, num_latents]
+        affinities = affinities.squeeze(1) #[B, num_latents]
 
-        need_ltm = self.ltm_gate(q).mean(dim=0)
+        weights = torch.softmax(affinities, dim=-1)
 
-        mem_output = torch.matmul(affinities.unsqueeze(1), v).squeeze(1)
+        p_ltm = self.ltm_gate(weights).mean(dim=0)
+
+        mem_output = torch.matmul(weights.unsqueeze(1), v).squeeze(1) #[B, hidden_dim]
         mem_output = self.ln1(mem_output)
         mem_output = self.mem_proj(mem_output)
 
 
-        #GATED UPDATE OF LATENT MEMORY
-        gates = self.gating(self.lin_gate(mem_output))
-        self.latent_memory = (1 - gates.mean(0)) * self.latent_memory + gates.mean(0) * mem_output #WORK ON THIS
+        #Need to configure update of latent memory
 
-        return mem_output, need_ltm
+        return mem_output, p_ltm
     
 """ 
 Hypernetwork to transition latent-stored memories to LTM? 
@@ -274,7 +283,7 @@ class IntegrationLayer(nn.Module):
         self.lin = nn.Linear(ent_dim * 2, ent_dim)
 
 
-    def forward(self, stm, h_ent, vae):
+    def forward(self, stm, h_ent, vae, p_ltm):
 
         vae_proj = self.proj_vae(vae)
         stm_proj = self.proj_stm(stm)
@@ -283,7 +292,7 @@ class IntegrationLayer(nn.Module):
         ent_proj = ent_proj.unsqueeze(1)
         stm_proj = stm_proj.unsqueeze(1)
         vae_proj = vae_proj.unsqueeze(1)
-
+        vae_proj = vae_proj * p_ltm
         """
         Concatenating along dimension 1 allow the attention mechanism to selectively
         use aspects of both z_proj and vae_proj in the key and value vectors.
@@ -398,7 +407,7 @@ class AH_Args:
     expansion = 10
     k = int(ent_dim * expansion * 0.05) #512 for ~5% sparsity
     z_dim = ent_dim * expansion
-    stage_1_hidden = 1024
+    stage_1_hidden = 256
     stage_2_context_dim = embd_dim
     num_latents = 8
     latent_size = 256
@@ -418,7 +427,7 @@ class AH(nn.Module):
         self.args = args
 
         self.stage1_loss = nn.MSELoss()
-        self.recon_thresh = 10
+        self.ltm_thresh = 0.7
 
         self.entorhinal = EntorhinalLayer(args.proj_dim, args.ent_dim)
         self.compression = CompressionLayer(args.ent_dim, args.expansion, args.k)
@@ -513,18 +522,17 @@ class AH(nn.Module):
                 sae_recon, loss_sparse = self.ltm(latent_full, 0)
                 self.sae_recon = sae_recon
 
-    def retrieve(self, query):
+    def retrieve(self, query, captured_kv):
         
         ent_out = self.entorhinal(query)
-        mem_trace, use_ltm = self.stage_1(ent_out)
+        mem_trace, use_ltm = self.stage_1(ent_out, captured_kv['k'], captured_kv['v'])
 
-        if use_ltm:
-            z_sparse = self.compression(ent_out)
-            latents = self.stage_2(z_sparse)
-            latent_full = torch.stack(latents)
-            sae_out = self.ltm(latent_full, 1)
-        
-        int_out = self.integration(mem_trace, ent_out, sae_out)
+        z_sparse = self.compression(ent_out)
+        latents = self.stage_2(z_sparse)
+        latent_full = torch.stack(latents)
+        sae_out = self.ltm(latent_full, 1)
+    
+        int_out = self.integration(mem_trace, ent_out, sae_out, use_ltm)
         final = self.output(int_out)
         self.final_output = final
 
@@ -667,7 +675,7 @@ class LlamaWithAH(nn.Module):
                 # project to AH query dim
                 query = self.projection_head(query_pre)  # [B, q_dim]
                 # Synchronous AH retrieval
-                mem_vec = self.ah.retrieve(query)  # should be [B, H]
+                mem_vec = self.ah.retrieve(query, self.captured_kv)  # should be [B, H]
                 # ensure mem_vec on same device and dtype
                 mem_vec = mem_vec.to(device).type(dtype)
                 # break out and continue from this exact hidden_states
