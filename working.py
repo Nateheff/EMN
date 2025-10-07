@@ -108,7 +108,7 @@ hidden state from our stage 1 memoy as this serves as a context embedding.
 """
 
 class Stage2(nn.Module):
-    def __init__(self, z_dim, ctx_dim, num_latents, latent_size, num_layers):
+    def __init__(self, z_dim, embd_dim):
 
         """
         Here we use a Perceiver Style Cross Attention mechanism. Our Stage 2 memory
@@ -118,34 +118,42 @@ class Stage2(nn.Module):
         """
         super().__init__()
 
-        self.input_proj = nn.Linear(z_dim + ctx_dim, latent_size)
+        self.embd = nn.Embedding(z_dim, embd_dim)
 
-        self.latents = nn.Parameter(torch.randn((num_latents, latent_size)))
-
-        self.cross_attention = nn.ModuleList([
-            nn.TransformerDecoderLayer(
-                d_model = latent_size,
-                nhead=4,
-                dim_feedforward=latent_size * 2,
-                batch_first=True
-            )
-
-            for _ in range(num_layers)
-        ])
+        self.attn_gate = nn.Sequential(
+            nn.Linear(embd_dim, embd_dim),
+            nn.Tanh(),
+            nn.Linear(embd_dim, 1)
+        )
 
 
+    def forward(self, z_sparse, context_embedding):
+        
+        active_idx = (z_sparse > 0).nonzero(as_tuple=False) #Find the position of all nonzero elements in z_sparse 
+        batch_idx = active_idx[:, 0] #Which batch each activation belongs to
+        feature_idx = active_idx[:, 1] #Which feature is active
 
-    def forward(self, z_sparse):
-        # Expand latents for batch
-        B = z_sparse.size(0)
-        latents = self.latents.unsqueeze(0).expand(B, -1, -1)
-        contextualized = torch.cat([z_sparse, context_embedding], dim=-1)
-        proj = self.input_proj(contextualized).unsqueeze(1) # (B, 1, latent_dim) NOT CURRENTLY USING
+        emb = self.embd(feature_idx)
+        ctx = context_embedding[batch_idx]
 
-        for layer in self.cross_attention:
-            latents = layer(tgt=latents, memory=proj) #latents are used for query, proj for key and value
+        attn_scores = (ctx * emb).sum(-1) / math.sqrt(emb.size(-1))
+        attn_weights = torch.zeros_like(attn_scores)
+        for b in range(z_sparse.size(0)):
+            mask = (batch_idx == b)
+            attn_weights[mask] = torch.softmax(attn_scores[mask], dim=0)
 
-        return latents #(B, num_latents, latent_size)
+        out = torch.zeros(z_sparse.size(0), emb.size(1), device=z_sparse.device) #[B, embd_dim]
+
+        #For each row index in batch_idx add emb[i] * attn_weights[i]
+        out.index_add_(0, batch_idx, emb * attn_weights.unsqueeze(-1))
+
+        #This is a vector where each element (counts[i]) is the frequency of i in batch_idx
+        #Essentially, how many active features each batch sample has. Clamp ensures we don't
+        # divide by zero if some batch sample had no active features
+        counts = torch.bincount(batch_idx, minlength=z_sparse.size(0)).clamp(min=1)
+        out /= counts.unsqueeze(-1)
+
+        return out
 
 
 """
@@ -161,6 +169,7 @@ class Stage1(nn.Module):
     def __init__(self, ent_dim, proj_dim, hidden_dim, num_latents=64):
         super().__init__()
         self.alpha = 0.01
+        self.num_latents = num_latents
         self.latent_memory = nn.Parameter(torch.zeros((num_latents,hidden_dim)))
 
         self.v_proj = nn.Linear(hidden_dim, proj_dim)
@@ -181,7 +190,23 @@ class Stage1(nn.Module):
 
         self.mem_proj = nn.Linear(proj_dim, hidden_dim)
         self.ln1 = nn.LayerNorm(proj_dim)
+        self.llm_ln1 = nn.LayerNorm(proj_dim)
         
+        self.novelty = None
+
+        
+    def _compute_novelty(self, weights):
+        #High entropy = distributed attention = novel input
+        """
+        Weights are the sigmoid of our affinities and thus summing them
+        along this dimension gives us the total familiarity or similarity to 
+        previously learned keys of this query.
+
+        """
+        entropy = -torch.sum(weights * torch.log(weights + 1e-8), dim=-1)
+        novelty = torch.sigmoid(entropy - torch.log(self.num_latents))
+        return novelty
+    
 
     def forward(self, ent_out, llm_k, llm_v):
 
@@ -190,24 +215,32 @@ class Stage1(nn.Module):
         latent memory.
         In a query pass, we perform a gated update to the latent memory which should perform a very slight update.
         """
-
         B, H, L, D_h = llm_k.shape #[batch, heads, query_len, head_dim]
+        latent = self.latent_memory.unsqueeze(0).expand(B, -1, -1) #[B, num_latents, ent_dim]
+
+
         llm_k = llm_k.reshape(B, L, H * D_h)
         llm_v = llm_v.reshape(B, L, H * D_h) #[batch, query_len, hidden_dim]
 
         llm_k = self.llm_k_proj(llm_k) #[B, query_len, proj_dim]
         llm_v = self.llm_v_proj(llm_v)
 
-        latent = self.latent_memory.unsqueeze(0).expand(B, -1, -1) #[B, num_latents, ent_dim]
         v = self.v_proj(latent) # [B, num_latents, proj_dim]
         k = self.k_proj(latent)
-
         q = self.q_proj(ent_out) #[B, proj_dim]
 
         affinities = torch.matmul(q.unsqueeze(1), k.transpose(-1, -2))/ math.sqrt(self.proj_dim) #[B, 1, num_latents]
         affinities = affinities.squeeze(1) #[B, num_latents]
-
         weights = torch.softmax(affinities, dim=-1)
+        
+        self.novelty = self._compute_novelty(weights)
+
+        llm_aff = torch.matmul(q.unsqueeze(1), llm_k.transpose(-1, -2)) / math.sqrt(self.proj_dim) #[B, 1, query_len]
+        llm_aff = llm_aff.squeeze(1) #[128,103]
+        llm_weights = torch.softmax(llm_aff, dim=-1)
+
+        context = torch.matmul(llm_weights.unsqueeze(1), llm_v).squeeze(1) #CHECK DIMS
+        context = self.llm_ln1(context) #We can pass this to Stage 2 as context
 
         p_ltm = self.ltm_gate(weights).mean(dim=0)
 
@@ -218,7 +251,54 @@ class Stage1(nn.Module):
 
         #Need to configure update of latent memory
 
-        return mem_output, p_ltm
+        return mem_output, p_ltm, context
+    
+    def update(self, ent_out, mem_trace, novelty, reward, lr=0.05):
+        """
+        We want to update our latent memory to contain tractable information about the recent memory without
+        forgetting significant detials of other stored memories.
+
+        A couple of thoughts:
+        1) It is difficult to think of what targets could be or any loss could be for replaying
+        a memory through the Stage 1 multiple times. 
+        2)A hypernetwork is an interesting thought where we have a netowrk that learns to 
+        create good update representations that are stored in the latent memory. This would
+        be context aware and goal oriented. The network could receive the entorhinal output,
+        memory trace, cross-entropy loss of the completion, and the user feedback to create a
+        context-aware representation that will be useful on future forward queries.
+        3) Not sure if its possible, but using the gradients passed back to the Stage 1 netowrk
+        and passin gthe gradients through a separate Linear layer or something like that to act
+        as the 'hypernetwork" which updates the Stage 1 memory.
+
+
+        CURRENT SOLUTION:
+        
+        A Hebian-style gated update
+        ent_out: [B, ent_dim]
+        mem_trace: [B, hidden_dim]
+        lr: learning rate or update strength
+
+        POSSIBLE FUTURE EXTENSION:
+
+        Take in feedback signal and do something like:
+            novelty = torch.sigmoid(feedback_signal)
+        if using a reward signal or something like that for dopamine-inspired modulation
+        """
+
+        with torch.no_grad():
+            q = self.q_proj(ent_out) #[B, proj_dim]
+            k = self.k_proj(self.latent_memory) #[num_lantents, proj_dim]
+            weights = torch.softmax(q @ k.T / math.sqrt(self.proj_dim), dim=-1) #[B, num_latents]
+
+            candidate = self.v_proj(mem_trace)
+
+            delta = torch.matmul(weights.T, candidate) / weights.sum(0, keepdim=True).clamp(min=1e-6)
+            novelty = novelty * torch.sigmoid(reward)
+            self.latent_memory.data = (
+                (1 - lr * novelty.mean()) * self.latent_memory.data + lr * delta
+            )
+
+
     
 """ 
 Hypernetwork to transition latent-stored memories to LTM? 
@@ -399,6 +479,41 @@ class MonosynapticInjector(nn.Module):
         return self.norm(injected) 
 
 
+class MemoryTrace(nn.Module):
+    def __init__(self, prompt, completion, feedback, embd_dim, proj_dim, storage_dim):
+        super.__init__()
+        
+        #Ideally these are the tokens
+        self.prompt = prompt
+        self.completion = completion
+        self.feedback = feedback
+
+        self.prompt_proj = nn.Linear(embd_dim, proj_dim)
+        self.completion_proj = nn.Linear(embd_dim, proj_dim)
+        self.feedback_proj = nn.Linear(embd_dim, proj_dim)
+
+        self.trace_integrator = nn.Linear(proj_dim * 3, storage_dim)
+        self.trace_act = nn.SiLU()
+
+    def create_trace(self, llm):
+
+        prompt_emb = llm.embed(self.prompt)
+        completion_emb = llm.embed(self.completion)
+        feedback_emb = llm.embed(self.feedback)
+
+        prompt_proj = self.prompt_proj(prompt_emb)
+        completion_proj = self.completion_proj(completion_emb)
+        feedback_proj = self.feedback_proj(feedback_emb)
+
+        trace = torch.cat([prompt_proj, completion_proj, feedback_proj], dim=-1)
+        integrated = self.trace_act(self.trace_integrator(trace))
+
+        return integrated
+        
+
+
+        
+
 @dataclass
 class AH_Args:
     proj_dim = 512
@@ -408,15 +523,16 @@ class AH_Args:
     k = int(ent_dim * expansion * 0.05) #512 for ~5% sparsity
     z_dim = ent_dim * expansion
     stage_1_hidden = 256
-    stage_2_context_dim = embd_dim
+    stage_2_context_dim = proj_dim #Our context is coming from our stage 1
     num_latents = 8
-    latent_size = 256
+    stage_2_emb = proj_dim
     num_layers = 2
-    storage_dim = num_latents * latent_size
-    retrieval_dim = z_dim
+    storage_dim = stage_2_emb
+    retrieval_dim = stage_2_emb
     vae_dim = 512
     int_dim = ent_dim
     batch_size = 128
+    mem_dim = 256
     
 
 
@@ -432,12 +548,13 @@ class AH(nn.Module):
         self.entorhinal = EntorhinalLayer(args.proj_dim, args.ent_dim)
         self.compression = CompressionLayer(args.ent_dim, args.expansion, args.k)
         self.stage_1 = Stage1(args.ent_dim, args.proj_dim, args.stage_1_hidden)
-        self.stage_2 = Stage2(args.z_dim, args.stage_2_context_dim, args.num_latents, args.latent_size, args.num_layers)
+        self.stage_2 = Stage2(args.z_dim, args.stage_2_emb)
         self.ltm = SAE_LTM(args.storage_dim, args.retrieval_dim)
-        self.integration = IntegrationLayer(args.z_dim, args.ent_dim, args.vae_dim)
+        self.integration = IntegrationLayer(args.mem_dim, args.ent_dim, args.vae_dim)
         self.output = OutputLayer(args.embd_dim, args.int_dim)
 
-
+        self.ent_out  = None #Will need to store for Stage 1 update later
+        self.query = None #Will need for feedback module
 
         #NOTE: We have these spread throughout, and they are (for the most part) WRONG! When we need 
         # to be calculating these recon losses online for stage 1 and SAE. 
@@ -487,7 +604,7 @@ class AH(nn.Module):
                 self.sae_recon = sae_recon
 
 
-    def storage(self, query, captured_kv, consolidation=False):
+    def store(self, query, captured_kv, consolidation=False):
         
         ent_out = self.entorhinal(query)
         fam_score = self.familiarity_store(ent_out)
@@ -523,14 +640,18 @@ class AH(nn.Module):
                 self.sae_recon = sae_recon
 
     def retrieve(self, query, captured_kv):
+
+        self.query = query
         
         ent_out = self.entorhinal(query)
-        mem_trace, use_ltm = self.stage_1(ent_out, captured_kv['k'], captured_kv['v'])
+        self.ent_out = ent_out
+
+        mem_trace, use_ltm, ctx = self.stage_1(ent_out, captured_kv['k'], captured_kv['v'])
 
         z_sparse = self.compression(ent_out)
-        latents = self.stage_2(z_sparse)
-        latent_full = torch.stack(latents)
-        sae_out = self.ltm(latent_full, 1)
+        abstract = self.stage_2(z_sparse, ctx) #[B, proj_dim]
+         #[B, num_latents * latent_dim]
+        sae_out, z_sparse_loss = self.ltm(abstract, 1)
     
         int_out = self.integration(mem_trace, ent_out, sae_out, use_ltm)
         final = self.output(int_out)
@@ -563,6 +684,7 @@ class LlamaWithAH(nn.Module):
         self.tokenizer = tokenizer
         self.transformer = self.base.model  
         self.hidden_size = self.base.config.hidden_size
+        self.args = args
 
         self.pause_layer = pause_layer
         self.inject_layers = inject_layers
@@ -691,7 +813,7 @@ class LlamaWithAH(nn.Module):
                                   attention_mask=attention_mask, 
                                   position_ids=position_ids,
                                   position_embeddings=position_embeddings)
-            hidden_states = layer_outputs[0]
+            
 
             # apply MSI after this layer if configured
             if j in self.inject_layers:
@@ -765,7 +887,37 @@ class AHLoss(nn.Module):
             loss += self.ll * ce_loss
 
         return loss
-        
+
+
+class RewardModel(nn.Module):
+    def __init__(self, embed_dim, hidden_dim):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(embed_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.SiLU(),
+            nn.Linear(hidden_dim // 2, 1),
+            nn.Tanh()
+        )
+
+        self.attn = nn.Linear(embed_dim, 1)
+
+    def forward(self, query, response): #Receives the embeddings
+
+        embs = torch.cat([query, response], dim=-1)
+
+        attn_scores = self.attn(embs)
+        weights = F.softmax(embs, dim=1)
+
+        pooled = weights * embs
+        pooled = F.normalize(pooled, dim=-1)
+
+        r = self.net(pooled).squeeze(-1)
+
+        return r
+
+
 
 def stage_1_training():
 
@@ -839,10 +991,38 @@ def stage_1_training():
         inputs = tokenizer(batch, truncation=True, padding=True, return_tensors='pt', max_length=128)
         input_ids = inputs.input_ids.to(device)
         # attn_mask = inputs.attention_mask.to(device)
-
+        input_embds = None
         
         logits = model.forward(input_ids)
 
+        #Decode
+        completion = None
+
+        #Get Feedback 
+        """
+
+        Thoughts on Feedback:
+
+        When creating a memory, we need to know if what we said went over well to know if our memory is working
+        well or not. An essential part of a memory is the result of our output. Having a feedback signal will
+        help us get a gauge of where we are in terms of memory, reasoning, and the integration of these two.
+        It will also let us know how "important" a memory is alongside its novelty as a memory that results
+        in an extreme feedback signal either way should be remembered well.
+
+        Currently, a reward model seems the most straight-forward method for getting a reward signal. An 
+        important detail is that we will need to figure out how to interpret no direct feedback. 
+        No direct feedback on a question is usually a good thing sincce this means that we answered the 
+        question in its entirety and there is no need for further dialogue, but there may be instances
+        where no feedback is a bad thing, so we will need to train our model on these scenarios.
+        """
+        reward_m = RewardModel(model.args.embd_dim, hidden_dim=512)
+        feedback = reward_m(input_embds, completion)
+        #Create memory trace
+        mem_trace = MemoryTrace(input_ids, completion, feedback, model.args.embd_dim, model.args.storage_dim)
+        mem_trace = mem_trace.create_trace(model)
+        
+        
+        model.ah.stage_1.update(model.ah.ent_out, mem_trace, model.ah.stage_1.novelty, feedback)
         loss = loss_fn(
             model.ah.stage1_input,
             model.ah.stage1_recon,
