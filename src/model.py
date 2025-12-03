@@ -1,5 +1,6 @@
 from transformers import AutoTokenizer, AutoModelForCausalLM
 from transformers.modeling_attn_mask_utils import _create_4d_causal_attention_mask
+from src.replay import PrioritizedMemory
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -11,12 +12,15 @@ from data import *
 import math
 
 
-import traceback, sys
+
 
 """
-This projection layer takes the lst hidden state of the LLM as input and outputs a query to the AH.
+
+This projection layer takes the hidden state of the LLM as input and outputs a query to the AH.
 This query is not english, but a learned representation for the LLM to query the AH. This query
 is first received by the Entorhinal layer and proected into ent_dim.
+
+Bascially, take 2048-D hidden state -> 512-D query vector
 """
 class ProjectionHead(nn.Module):
 
@@ -39,6 +43,8 @@ The Entorhinal Layer is a dense layer receiving the query/queue from the LLM tha
 into a space that is understood and used by the AH. This layer doesn't need to be complex or fancy,
 just a single nonlinear projection. This layer is preparing the query for pattern separation in the 
 compression layer.
+
+take 512-D -> 1024-D with some contextual embedding
 """
 class EntorhinalLayer(nn.Module):
     def __init__(self, query_dim, ent_dim):
@@ -74,6 +80,8 @@ The Compression Layer (Dentate Gyrus/CA3)
 The compression layer is receives the output from the entorhinal layer and the storage retrieval score. It then signficiantly expands it into a very high dimension space that will be used to 
 sparsify for pattern separation. The ReLU begins the pattern seprartion by removing negatives.
 We significantly sparsify using K-Winner-Takes-All to finalize pattern separation. Our output should have ~2-5% activiation.
+
+TL;DR: Separates patterns creating unique sparse code of memory.
 """
 
 class CompressionLayer(nn.Module):
@@ -101,10 +109,9 @@ class CompressionLayer(nn.Module):
 """
 Stage 2 Memory (Abstract Reconstruction)
 
-Our Stage 2 memory creates an abstract reconstruction of the memory we are looking to store. This
-is where our memory is contextualized and prepared for long-term storage. We replay through our stage
-2 memory during downtime for long-term consolidation. We input not only z_sparse, but also the 
-hidden state from our stage 1 memoy as this serves as a context embedding.
+Our stage 2 memory is designed to extract a compressed, abstract gist of the memory. It does this by finding
+the indices of active neurons in the sparse code, embedding the indices, attending to them with context, and 
+producing a vector for each batch element.
 """
 
 class Stage2(nn.Module):
@@ -125,6 +132,7 @@ class Stage2(nn.Module):
             nn.Tanh(),
             nn.Linear(embd_dim, 1)
         )
+
 
 
     def forward(self, z_sparse, context_embedding):
@@ -159,7 +167,21 @@ class Stage2(nn.Module):
 """
 Stage 1 Memory (High-Fidelity Reconstuction)
 
-Our Stage 1 Memory is responsible for avoid catastrophic forgetting. The layer takes in just z_sparse as input, but also uses the key and value vectors from our LLM to contextualize the reconstruction. This layer's output is never actually used, but this is intentional. What we want from this layer is context. We get context in two forms: gradient and hidden state. Each memory that is stored is first passed through Stage 1 and ran through multiple times with an update until we have an accurate enough reconstruction (determined by familiarity score). These updates create a very rich hidden state that is then passed as context into our Stage 2 memory when it is time for long-term consolidation. The gradients from these updates flow to the earlier layers of the AH ensuring that the mappings and weights for this memory are persisted. Loss is computed by comparing reconstruction to original LLM embedding for that memory.
+Our Stage 1 memory is probably the most crucial part of this memory circuit. It is responsible for creating and 
+maintaining a latent memory to avoid catastrophic forgetting and will be used for offline consolidation, it creates 
+a context-rich cue for our Stage 2 abstraction, and computes the novelty of a memory. 
+The most important of these roles is the latent memory. Catastrophic forgetting is an obivous hurdle for a module
+such as this one, and creating an efficient, compact, and robust short-term memory was high priority. Our latent memory
+is attended to by the entorhinal output to create a context-aware memory trace. THis trace won't be explicitly used 
+for storage, but the trace will be replayed until we have a sufficiently high-fidelity reconstruction to avoid forgetting.
+While computing the attention weights between the entorhinal output and latent memory, we are able to compute the 
+novelty of the entorhinal output which is used to determine the strength with which we should "focus on" this memory.
+More novel memories get more focus.
+Finally, our Stage 1 memory receives the key and value vectors from the llm which contain rich context that we use 
+to create a context embedding for our stage 2 memory.
+
+TL;DR: Stage 1 is responsible for embedding a lot fo context from the entorhinal layer and LLM and maintain a 
+short-term memory in the form of latent vectors to prevent catastropic forgetting.
 """
 class Stage1(nn.Module):
     """
@@ -258,17 +280,8 @@ class Stage1(nn.Module):
         We want to update our latent memory to contain tractable information about the recent memory without
         forgetting significant detials of other stored memories.
 
-        A couple of thoughts:
-        1) It is difficult to think of what targets could be or any loss could be for replaying
-        a memory through the Stage 1 multiple times. 
-        2)A hypernetwork is an interesting thought where we have a netowrk that learns to 
-        create good update representations that are stored in the latent memory. This would
-        be context aware and goal oriented. The network could receive the entorhinal output,
-        memory trace, cross-entropy loss of the completion, and the user feedback to create a
-        context-aware representation that will be useful on future forward queries.
-        3) Not sure if its possible, but using the gradients passed back to the Stage 1 netowrk
-        and passin gthe gradients through a separate Linear layer or something like that to act
-        as the 'hypernetwork" which updates the Stage 1 memory.
+        Our update should strongly embed novle and important memories, but very slowly override existing memories. 
+        We want plasticity without forgetting.
 
 
         CURRENT SOLUTION:
@@ -285,23 +298,38 @@ class Stage1(nn.Module):
         if using a reward signal or something like that for dopamine-inspired modulation
         """
 
-        with torch.no_grad():
-            q = self.q_proj(ent_out) #[B, proj_dim]
-            k = self.k_proj(self.latent_memory) #[num_lantents, proj_dim]
-            weights = torch.softmax(q @ k.T / math.sqrt(self.proj_dim), dim=-1) #[B, num_latents]
+        q = self.q_proj(ent_out) #[B, proj_dim]
+        k = self.k_proj(self.latent_memory) #[num_lantents, proj_dim]
+        weights = torch.softmax(q @ k.T / math.sqrt(self.proj_dim), dim=-1) #[B, num_latents]
 
-            candidate = self.v_proj(mem_trace)
+        candidate = self.v_proj(mem_trace)
 
-            delta = torch.matmul(weights.T, candidate) / weights.sum(0, keepdim=True).clamp(min=1e-6)
-            novelty = novelty * torch.sigmoid(reward)
-            self.latent_memory.data = (
-                (1 - lr * novelty.mean()) * self.latent_memory.data + lr * delta
+        importance = novelty * torch.sigmoid(reward)
+
+        momentum = 0.9
+        update_stength = lr * importance.mean()
+
+        for i in range(self.num_latents):
+            slot_strength = weights[:, i].mean() * update_stength
+            self.latent_memory.data[i] = (
+                momentum * self.latent_memory.data[i] +
+                slot_strength * candidate.mean(0) +
+                (1 - momentum - slot_strength) * self.latent_memory.data[i]
             )
+
+        #Homeostatic decay of unused slots (slowly forget old memories)
+        decay_rate = 0.001
+        unused_mask = (weights.mean(0) < 0.1)
+        self.latent_memory.data[unused_mask] *= (1-decay_rate)
 
 
     
 """ 
-Hypernetwork to transition latent-stored memories to LTM? 
+SAE (Neocortex)
+
+The goal of this is to take our stage 2 vectors and create a reconstructible distributed representation of the memory.
+Sparsity allows for greater pattern separation and thus a greater combination of unique memories that can be safely
+stored.
 """
 
 class SAE_LTM(nn.Module):
@@ -314,30 +342,36 @@ class SAE_LTM(nn.Module):
         self.encoder = nn.Linear(input_dim, hidden_dim)
         self.relu = nn.ReLU()
         self.decoder = nn.Linear(hidden_dim, input_dim)
+        self.targets = None
+
+        self.loss = nn.MSELoss()
+        self.lr = 1e-5
+        self.optimizer = torch.optim.AdamW(self.parameters(), lr=self.lr)
 
     def forward(self, x, mode, k=512):
 
         if mode == 0:
             x = self.silu(self.storage_head(x))
         else:
+            self.targets = x
             x = self.silu(self.retrieval_head(x))
             
         h = self.relu(self.encoder(x))
+
+        #ADAPTIVE SPARISTY
+        activation_entropy = -torch.sum(
+            torch.softmax(h, dim=-1) * torch.log_softmax(h, dim=-1),
+            dim=-1
+        )
+        #Higher entropy = less compressible = need more active units
+        k = int(k * (1 + 0.5 * activation_entropy.mean() / torch.log(torch.tensor(h.size(-1)))))
+        k = min(k, h.size(-1) // 2) #Cap sparsity at 50%
+
         z_sparse = kWTA(h, k)
 
         recon = self.decoder(z_sparse)
         return recon, z_sparse #We use this z_sparse for our loss, nothing else
     
-    def loss(self, recon, target_1, target_2, z_sparse, beta=0.3, gamma=1e-4):  #Maybe add importance weighting
-
-        
-        stage_1_recon = F.mse_loss(recon, target_1)
-
-        stage_2_recon = F.mse_loss(recon, target_2)
-
-        sparsity_loss = torch.mean(torch.abs(z_sparse))
-
-        return stage_1_recon + (beta * stage_2_recon) + (gamma * sparsity_loss)
     
 
     
@@ -345,8 +379,8 @@ class SAE_LTM(nn.Module):
 """
 Integration Layer (CA1)
 
-Our Integration Layer is responsible for integrating memory traces with context. From the Compression layer (CA3) the Intregation layer receives the top z_sparse traces stores in our memory buffer and then integrates them with context from the entorhinal layer.
-From the VAE LTM, the Integration layer recevies the decoder reconstructions and integrates them with context from the entorhinal layer
+This layer does as it says; it integrates. It integrates our memory trace with context from various different parts of 
+the memory module which have processed the query up to this point.
 """
 
 class IntegrationLayer(nn.Module):
@@ -480,13 +514,14 @@ class MonosynapticInjector(nn.Module):
 
 
 class MemoryTrace(nn.Module):
-    def __init__(self, prompt, completion, feedback, embd_dim, proj_dim, storage_dim):
+    def __init__(self, prompt, completion, embd_dim, proj_dim, storage_dim, feedback=None, reward=None):
         super.__init__()
         
         #Ideally these are the tokens
         self.prompt = prompt
         self.completion = completion
         self.feedback = feedback
+        self.reward = reward
 
         self.prompt_proj = nn.Linear(embd_dim, proj_dim)
         self.completion_proj = nn.Linear(embd_dim, proj_dim)
@@ -496,14 +531,22 @@ class MemoryTrace(nn.Module):
         self.trace_act = nn.SiLU()
 
     def create_trace(self, llm):
+        """
+        Here we need to figure out what to do when we receive no explicit feedback from the user. Most of our training
+        data will not include user feedback, we will likely need to create our own feedback examples
+        """
 
         prompt_emb = llm.embed(self.prompt)
         completion_emb = llm.embed(self.completion)
-        feedback_emb = llm.embed(self.feedback)
+        if self.feedback:
+            feedback_emb = llm.embed(self.feedback)
+            feedback_proj = self.feedback_proj(feedback_emb)
+        else:
+            feedback_proj = None
 
         prompt_proj = self.prompt_proj(prompt_emb)
         completion_proj = self.completion_proj(completion_emb)
-        feedback_proj = self.feedback_proj(feedback_emb)
+        
 
         trace = torch.cat([prompt_proj, completion_proj, feedback_proj], dim=-1)
         integrated = self.trace_act(self.trace_integrator(trace))
@@ -555,9 +598,6 @@ class AH(nn.Module):
 
         self.ent_out  = None #Will need to store for Stage 1 update later
         self.query = None #Will need for feedback module
-
-        #NOTE: We have these spread throughout, and they are (for the most part) WRONG! When we need 
-        # to be calculating these recon losses online for stage 1 and SAE. 
 
 
         self.sae_input = None
@@ -686,6 +726,8 @@ class LlamaWithAH(nn.Module):
         self.hidden_size = self.base.config.hidden_size
         self.args = args
 
+        self.embeddings = None
+
         self.pause_layer = pause_layer
         self.inject_layers = inject_layers
 
@@ -753,7 +795,7 @@ class LlamaWithAH(nn.Module):
         
 
 
-    def forward(self, input_ids: torch.LongTensor):
+    def forward(self, input_ids: torch.LongTensor, targets=None):
         """
         Runs: embed -> layers 0..pause_layer-1 -> pause & AH retrieval -> continue layers ->
         apply MSI at inject_layers -> final norm & lm_head -> logits
@@ -762,6 +804,7 @@ class LlamaWithAH(nn.Module):
 
         # embeddings (use underlying model's embedding)
         hidden_states = self.transformer.embed_tokens(input_ids).to(self.device)  # [B, L, H]
+        self.embeddings = hidden_states
 
         B, L, H = hidden_states.shape
         device = hidden_states.device
@@ -823,18 +866,25 @@ class LlamaWithAH(nn.Module):
         hidden_states = self.transformer.norm(hidden_states)
         logits = self.base.lm_head(hidden_states)
 
-        return logits
+        if targets:
+
+            loss = F.cross_entropy(logits, targets, ignore_index=-100, reduction='mean')
+        else:
+            loss = 0
+
+        return logits, loss
 
     # convenience method: decode via base tokenizer/generate without memory integration (use with care)
     def generate_with_memory(self, input_ids, max_new_tokens=256):
         # You need a custom generation loop to integrate AH at each step.
         # For now this delegates to base generate (no AH integration). Use only for testing.
         for _ in range(max_new_tokens):
-            logits = self(input_ids)
+            logits, _ = self(input_ids)
             logits = logits[:, -1, :]
             probs = F.softmax(logits, dim=-1) # (B, C)
             # sample from the distribution
             print("PROBS: ",probs[:5])
+
 
             idx_next = probs.argmax(dim=-1, keepdim=True) #only take token with highest probability
             # append sampled index to the running sequence
@@ -845,48 +895,6 @@ class LlamaWithAH(nn.Module):
     def __del__(self):
         if hasattr(self, 'hook_handle'):
             self.hook_handle.remove()
-
-
-
-class AHLoss(nn.Module):
-    def __init__(self, lambda_stage1=1.0, lambda_stage2=1.0,
-                 lambda_sae=1.0, lambda_ah=1.0, lambda_lm=0.0):
-        super().__init__()
-        self.l1 = lambda_stage1
-        self.l2 = lambda_stage2
-        self.ls = lambda_sae
-        self.la = lambda_ah
-        self.ll = lambda_lm
-
-        self.mse = nn.MSELoss()
-
-    def forward(self, stage1_in, stage1_recon, stage2_in, stage2_recon, sae_in, sae_recon, ah_output, stage1_norm, stage2_norm, sae_norm, ah_target=None, lm_logits=None, lm_labels=None):
-
-        loss = 0.0
-
-        if stage1_in is not None and stage1_recon is not None:
-            loss += self.l1 * self.mse(stage1_recon, stage1_in) * stage1_norm
-        
-        if stage2_in is not None and stage2_recon is not None:
-            loss += self.l2 * self.mse(stage2_recon, stage2_in) * stage2_norm
-
-        if sae_in is not None and sae_recon is not None:
-            loss += self.ls * self.mse(sae_recon, sae_in) * sae_norm
-
-        # AH/global loss
-        if ah_target is not None:
-            loss += self.la * self.mse(ah_output, ah_target)
-
-        # optional LLM cross-entropy
-        if lm_logits is not None and lm_labels is not None:
-            ce_loss = F.cross_entropy(
-                lm_logits.view(-1, lm_logits.size(-1)),
-                lm_labels.view(-1),
-                ignore_index=-100
-            )
-            loss += self.ll * ce_loss
-
-        return loss
 
 
 class RewardModel(nn.Module):
@@ -916,7 +924,48 @@ class RewardModel(nn.Module):
         r = self.net(pooled).squeeze(-1)
 
         return r
+    
 
+def jitter(memory, priority):
+    sigma = 0.03 + 0.05 * priority
+
+    memory = memory + torch.randn_like(memory) * sigma * memory.std(dim=0, keepdim=True)
+
+    return memory
+
+
+def store_memories(memories, rewards, novelties, buffer):
+    reward_beta = 1e-5
+
+    for memory, novelty, reward in zip(memories, novelties, rewards):
+        priority = novelty * (1 + reward_beta * F.sigmoid(reward))
+        buffer.add(memory, priority)
+
+
+
+def consolidate(mem_buffer, sae:SAE_LTM, n_epochs):
+
+    sae.optimizer.lr = sae.lr * 10 #boost lr for consolidation
+
+    for epoch in range(n_epochs):
+
+        batch, priorities = mem_buffer.get()
+
+        batch_input = jitter(batch)
+        recons, _ = sae(batch_input)
+
+        for recon, target, priority in zip(recons, batch, priorities):
+            loss = sae.loss(recon, target)
+
+            weighted_loss = loss * priority
+            weighted_loss.backward()
+
+            sae.optimizer.step()
+            sae.optimizer.zero_grad()
+
+            
+
+        
 
 
 def stage_1_training():
@@ -949,23 +998,7 @@ def stage_1_training():
 
     optimizer = optim.AdamW(trainable_params, lr=1e-4)
 
-    loss_fn = AHLoss(
-    lambda_stage1=1.0,
-    lambda_stage2=1.0,
-    lambda_sae=1.0,
-    lambda_ah=0.5,
-    lambda_lm=0.1  # small weight on LM loss early
-    )
-
     total_params = sum(p.numel() for p in trainable_params)
-
-    stage_1_params = sum(p.numel() for p in model.ah.stage_1.parameters())
-    stage_2_params = sum(p.numel() for p in model.ah.stage_2.parameters())
-    sae_params = sum(p.numel() for p in model.ah.ltm.parameters())
-
-    stage1_norm = stage_1_params / total_params
-    stage2_norm = stage_2_params / total_params
-    sae_norm = sae_params / total_params
 
     trivia = load_dataset("trivia_qa", "rc.nocontext")
     trivia = load_dataset("trivia_qa", "rc.nocontext")  # "rc" = reading comprehension version
@@ -979,28 +1012,66 @@ def stage_1_training():
     answers = train_data['answer']
     answers = [answer['value'] for answer in answers]
 
+    separator = ' Answer:'
+    dset = Stage1_Dataset(questions, answers, separator)
+    dataloader = DataLoader(dset, batch_size=args.batch_size)
 
-    dset = Stage1_Dataset(questions, answers, ' Answer:')
-    dataloader = DataLoader(dset, batch_size=128)
+    mem_buffer = PrioritizedMemory(batch_size=args.batch_size)
     
     # device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     # inputs = tokenizer(prompts, padding=True, truncation=True, return_tensors='pt')
-    
+    consolidate_count = 0
     for batch in dataloader:
+        
         # inputs = preprocess_fn(batch, tokenizer, max_len=256)
         inputs = tokenizer(batch, truncation=True, padding=True, return_tensors='pt', max_length=128)
         input_ids = inputs.input_ids.to(device)
+        batch_size, seq_len = input_ids.shape
+        targets = input_ids.clone()
+
+        separator_ids = tokenizer.encode(separator, add_special_tokens=False)
+    
+        for b in range(args.batch_size):
+            # Find where answer starts (after separator)
+            answer_start = None
+            for i in range(seq_len - len(separator_ids)):
+                if input_ids[b, i:i+len(separator_ids)].tolist() == separator_ids:
+                    answer_start = i + len(separator_ids)
+                    break
+            
+            if answer_start is not None:
+                # Mask prompt tokens (set to -100 so they're ignored by CrossEntropyLoss)
+                targets[b, :answer_start] = -100
+            else:
+                # If separator not found, mask everything (safety)
+                targets[b, :] = -100
+            
+        # Shift for next-token prediction
+        targets = targets[:, 1:].contiguous()
+        answer_mask = (targets != -100)
         # attn_mask = inputs.attention_mask.to(device)
-        input_embds = None
         
-        logits = model.forward(input_ids)
+        
+        tokens, loss = model.forward(input_ids, targets) #GET TARGETS
+        input_embds = model.embeddings
+        memories = model.ah.ltm.targets
+        novelties = model.ah.stage_1.novelty
 
         #Decode
-        completion = None
+        """
+        We first need our token values of ONLY the completion and then get the embeddings of the completion.
+        We pass the embeddings of our prompt and completion into our memory trace and reward model
+        then we decode and pass to user (Or we could pass to user first and while they read we do the embeddings)
+        """
+        completions = tokenizer.batch_decode(tokens) 
+
 
         #Get Feedback 
+
+        feedback = None #We need to get user response for the memory trace. Maybe make feedback optional
         """
 
+        
         Thoughts on Feedback:
 
         When creating a memory, we need to know if what we said went over well to know if our memory is working
@@ -1016,35 +1087,50 @@ def stage_1_training():
         where no feedback is a bad thing, so we will need to train our model on these scenarios.
         """
         reward_m = RewardModel(model.args.embd_dim, hidden_dim=512)
-        feedback = reward_m(input_embds, completion)
+        rewards = reward_m(input_embds, completions)
         #Create memory trace
-        mem_trace = MemoryTrace(input_ids, completion, feedback, model.args.embd_dim, model.args.storage_dim)
+        mem_trace = MemoryTrace(input_ids, completions, model.args.embd_dim, model.args.storage_dim, feedback, rewards)
         mem_trace = mem_trace.create_trace(model)
         
+        store_memories(memories, rewards, novelties, mem_buffer)
+        consolidate_count += 1
+
+        if consolidate_count >= 7:
+            consolidate(mem_buffer, model.ah.ltm, n_epochs = 5)
+            consolidate_count = 0
         
-        model.ah.stage_1.update(model.ah.ent_out, mem_trace, model.ah.stage_1.novelty, feedback)
-        loss = loss_fn(
-            model.ah.stage1_input,
-            model.ah.stage1_recon,
-            model.ah.stage2_input,
-            model.ah.stage2_recon,
-            model.ah.sae_input,
-            model.ah.sae_recon,
-            model.ah.final_output,
-            stage1_norm,
-            stage2_norm,
-            sae_norm,
-            ah_target,
-            logits, 
-            targets
-            )
+        model.ah.stage_1.update(model.ah.ent_out, mem_trace, novelties, rewards)
         
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
+        optimizer.zero_grad()
         
         print(f"loss: {loss.item():.4f}")
 
 
 if __name__ == "__main__":
     stage_1_training()
+
+"""
+PROMPTS FOR TOMORROW:
+
+1) For my reward model, my desire is for it to receive the prompt and completion embedding
+and then output a scalar for the predicted reward. Thus, it would be trained with inputs of prompt and completion embeddings and a scalar target. However, it seems to be common practice 
+for the reward model to learn to prefer certain types of responses and to output based on preference. Should I stick with my current plan to train a reward model to output a simple scalar or should I adopt a prefernce-style reward model?
+
+2) Here is my current training plan:
+Stage 1
+I will first need to get a working reward model (hopefully we are able to find a pretrained one that outputs scalar rewards as desired). Once I have this, I will be freezeing the parameters of the language model and only training my AH parameters. I will be using the TriviaQA dataset for my stage 1 training and loss will be calculated on answers only. This will hopefully teach the AH to store facts and reintegrate them will the LLM.
+
+Stage 2
+In stage 2 I will unfreeze the LLM weights and begin training the whole system. I will be using the KILT dataset for stage 2. This should hopefully train the system to work as a whole and the AH will maintain its memory-storage role as it was taught in stage 1, and the LLM will learn to better utilize in Stage 2
+
+Stage 3
+Stage 3 will be RLHF, primarily for alignment and small semantic changes.
+
+I'm concerned with my Stage 1 as I'm not sure this training method will work well with my model set up. 
+The goal of my training is for the model to learn to work as a whole, letting the AH be responsible for memory storage and the LLM responsible for reasoning. 
+
+Deeply analyze this train plan and provide strengths and weaknesses. If there are significant weaknesses or inefficiencies, provide a more optimal training plan.
+"""
