@@ -13,3 +13,4 @@ def kWTA(input, k):
 
     # Apply the mask to the original tensor
     return input * mask
+
